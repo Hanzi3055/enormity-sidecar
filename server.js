@@ -6,13 +6,23 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const mysql = require('mysql2/promise');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+const WebSocket = require('ws');
+const Redis = require('ioredis');
+const axios = require('axios');
 const kpmEngine = require('./kpm-engine');
 
 const app = express();
 const startedAt = Date.now();
 const PORT = Number(process.env.PORT || 3100);
+const WS_PORT = Number(process.env.WS_PORT || 3101);
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-before-production';
 const VALID_API_KEYS = String(process.env.ENORMITY_API_KEYS || '').split(',').map((key) => key.trim()).filter(Boolean);
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT || '';
 
 const pool = mysql.createPool({
   host: process.env.MYSQL_HOST || '127.0.0.1',
@@ -26,6 +36,17 @@ const pool = mysql.createPool({
   timezone: 'local',
   dateStrings: false,
 });
+
+const redis = new Redis({
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: Number(process.env.REDIS_PORT || 16379),
+  lazyConnect: true,
+  maxRetriesPerRequest: 1,
+  enableOfflineQueue: false,
+});
+let redisReady = false;
+const cacheCounters = { hits: 0, misses: 0 };
+const notifiedEscalations = new Set();
 
 app.disable('x-powered-by');
 app.use(helmet());
@@ -87,6 +108,11 @@ function dateRange(date) {
   return [`${date} 00:00:00`, `${date} 23:59:59`];
 }
 
+function currentMonthYear() {
+  const now = new Date();
+  return { month: now.getMonth() + 1, year: now.getFullYear() };
+}
+
 function companyWhere(companyId, alias) {
   if (!companyId) return { clause: '', params: [] };
   const column = alias ? `${alias}.COMPANYID` : 'COMPANYID';
@@ -96,6 +122,57 @@ function companyWhere(companyId, alias) {
 async function query(sql, params = []) {
   const [rows] = await pool.execute(sql, params);
   return rows;
+}
+
+function firstResultSet(rows) {
+  return Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
+}
+
+async function ensureRedis() {
+  if (redisReady) return true;
+  try {
+    await redis.connect();
+    redisReady = true;
+    return true;
+  } catch (err) {
+    redisReady = false;
+    return false;
+  }
+}
+
+async function getCachedJson(key) {
+  if (!await ensureRedis()) return null;
+  try {
+    const value = await redis.get(key);
+    if (!value) {
+      cacheCounters.misses += 1;
+      return null;
+    }
+    cacheCounters.hits += 1;
+    return JSON.parse(value);
+  } catch (_) {
+    cacheCounters.misses += 1;
+    return null;
+  }
+}
+
+async function setCachedJson(key, ttlSeconds, value) {
+  if (!await ensureRedis()) return;
+  try {
+    await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds);
+  } catch (_) {}
+}
+
+async function sendCached(res, key, ttlSeconds, producer) {
+  const cached = await getCachedJson(key);
+  if (cached) {
+    res.setHeader('X-Cache', 'HIT');
+    return ok(res, cached);
+  }
+  const data = await producer();
+  res.setHeader('X-Cache', redisReady ? 'MISS' : 'BYPASS');
+  await setCachedJson(key, ttlSeconds, data);
+  return ok(res, data);
 }
 
 async function checkDatabase() {
@@ -211,13 +288,69 @@ app.get('/api/enormity/health', async (req, res) => {
   }
 });
 
+app.get('/api/enormity/status/overview', async (req, res) => {
+  const date = todayString();
+  const [start, end] = dateRange(date);
+  try {
+    const [totals, procedures, views, tables] = await Promise.all([
+      query(
+        `SELECT COUNT(*) AS totalScans,
+                COUNT(DISTINCT GUARDID) AS activeGuards,
+                COUNT(DISTINCT SITEID) AS activeSites
+           FROM historydatas
+          WHERE HAPPENTIME BETWEEN ? AND ?`,
+        [start, end]
+      ),
+      query(`SHOW PROCEDURE STATUS WHERE Db = DATABASE() AND Name LIKE 'sp\\_%'`),
+      query(`SHOW FULL TABLES WHERE Table_type = 'VIEW' AND Tables_in_cloudpatrol LIKE 'v\\_%'`),
+      query(`SHOW TABLES LIKE 'enormity\\_%'`),
+    ]);
+    return ok(res, {
+      date,
+      scansToday: Number(totals[0]?.totalScans || 0),
+      activeGuards: Number(totals[0]?.activeGuards || 0),
+      activeSites: Number(totals[0]?.activeSites || 0),
+      procedures: procedures.map((row) => row.Name),
+      views: views.map((row) => Object.values(row)[0]),
+      tables: tables.map((row) => Object.values(row)[0]),
+    });
+  } catch (err) {
+    return fail(res, 500, 'Failed to build status overview.', err.message);
+  }
+});
+
+app.get('/api/enormity/status/containers', (req, res) => {
+  try {
+    const output = execSync("docker ps --format '{{.Names}}|{{.Status}}|{{.Ports}}'", { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const rows = output.trim().split('\n').filter(Boolean).map((line) => {
+      const parts = line.split('|');
+      return { name: parts[0] || '', status: parts[1] || '', ports: parts[2] || '' };
+    });
+    return ok(res, { rows });
+  } catch (err) {
+    return fail(res, 500, 'Failed to read docker container status.', err.message);
+  }
+});
+
 app.post('/api/enormity/auth/token', requireApiKey);
+app.get('/api/enormity/docs', (req, res) => {
+  const specPath = path.join(__dirname, 'openapi.yaml');
+  if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
+  res.type('text/yaml');
+  return res.send(fs.readFileSync(specPath, 'utf8'));
+});
 app.use('/api/enormity', authenticateJwt);
 
 app.get('/api/enormity/patrol/summary', async (req, res) => {
   try {
     const date = validateDateParam(req.query.date);
     const companyId = req.query.companyId || '';
+    const cacheKey = `patrol:summary:${companyId || 'all'}:${date}`;
+    const cached = await getCachedJson(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return ok(res, cached);
+    }
     const [start, end] = dateRange(date);
     const company = companyWhere(companyId);
 
@@ -264,7 +397,7 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
       count: hourlyMap.get(hour) || 0,
     }));
 
-    return ok(res, {
+    const payload = {
       date,
       companyId: companyId || null,
       totalScans: Number(totals[0].totalScans || 0),
@@ -281,7 +414,10 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
         siteName: row.siteName,
         count: Number(row.count),
       })),
-    });
+    };
+    res.setHeader('X-Cache', redisReady ? 'MISS' : 'BYPASS');
+    await setCachedJson(cacheKey, 300, payload);
+    return ok(res, payload);
   } catch (err) {
     return fail(res, err.status || 500, 'Failed to build patrol summary.', err.message);
   }
@@ -330,6 +466,12 @@ app.get('/api/enormity/guards/efficiency', async (req, res) => {
   try {
     const date = validateDateParam(req.query.date);
     const companyId = req.query.companyId || '';
+    const cacheKey = `efficiency:${companyId || 'all'}:${date}`;
+    const cached = await getCachedJson(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return ok(res, cached);
+    }
     const [start, end] = dateRange(date);
     const company = companyWhere(companyId);
 
@@ -347,7 +489,7 @@ app.get('/api/enormity/guards/efficiency', async (req, res) => {
       [start, end, ...company.params]
     );
 
-    return ok(res, rows.map((row) => {
+    const payload = rows.map((row) => {
       const scansToday = Number(row.scansToday || 0);
       const activeHours = Number(row.activeHours || 0);
       const sitesPatrolled = Number(row.sitesPatrolled || 0);
@@ -365,7 +507,10 @@ app.get('/api/enormity/guards/efficiency', async (req, res) => {
         sitesPatrolled,
         efficiencyScore: Math.round(scanScore + hourScore + siteScore),
       };
-    }));
+    });
+    res.setHeader('X-Cache', redisReady ? 'MISS' : 'BYPASS');
+    await setCachedJson(cacheKey, 300, payload);
+    return ok(res, payload);
   } catch (err) {
     return fail(res, err.status || 500, 'Failed to compute guard efficiency.', err.message);
   }
@@ -424,6 +569,152 @@ app.get('/api/enormity/analytics/heatmap', async (req, res) => {
     })));
   } catch (err) {
     return fail(res, 500, 'Failed to build analytics heatmap.', err.message);
+  }
+});
+
+app.get('/api/enormity/patrol/missed', async (req, res) => {
+  try {
+    const companyId = parsePositiveInt(req.query.companyId, 1);
+    const date = validateDateParam(req.query.date);
+    const rows = firstResultSet(await query('CALL sp_missed_checkpoints(?, ?)', [companyId, date]));
+    return ok(res, { companyId, date, rows });
+  } catch (err) {
+    return fail(res, err.status || 500, 'Failed to fetch missed checkpoint analysis.', err.message);
+  }
+});
+
+app.get('/api/enormity/analytics/anomalies', async (req, res) => {
+  try {
+    const companyId = parsePositiveInt(req.query.companyId, 1);
+    const date = validateDateParam(req.query.date);
+    const rows = firstResultSet(await query('CALL sp_anomaly_detection(?, ?)', [companyId, date]));
+    return ok(res, { companyId, date, rows });
+  } catch (err) {
+    return fail(res, err.status || 500, 'Failed to fetch anomaly analysis.', err.message);
+  }
+});
+
+app.get('/api/enormity/analytics/compliance', async (req, res) => {
+  try {
+    const companyId = parsePositiveInt(req.query.companyId, 1);
+    const { month: currentMonth, year: currentYear } = currentMonthYear();
+    const month = parsePositiveInt(req.query.month, currentMonth, 12);
+    const year = parsePositiveInt(req.query.year, currentYear, 2100);
+    if (year < 2000) return fail(res, 400, 'Invalid year.');
+    const cacheKey = `compliance:${companyId}:${month}:${year}`;
+    return sendCached(res, cacheKey, 300, async () => {
+      const rows = firstResultSet(await query('CALL sp_company_compliance_report(?, ?, ?)', [companyId, month, year]));
+      return { companyId, month, year, rows };
+    });
+  } catch (err) {
+    return fail(res, err.status || 500, 'Failed to fetch compliance report.', err.message);
+  }
+});
+
+app.get('/api/enormity/guards/streaks', async (req, res) => {
+  try {
+    const companyId = req.query.companyId || '';
+    const company = companyWhere(companyId);
+    const rows = await query(
+      `SELECT companyid AS companyId,
+              guardid AS guardId,
+              guard_name AS guardName,
+              current_streak AS currentStreak,
+              longest_streak AS longestStreak,
+              last_patrol_date AS lastPatrolDate,
+              updated_at AS updatedAt
+         FROM enormity_guard_streaks
+        WHERE 1=1${company.clause}
+        ORDER BY current_streak DESC, longest_streak DESC, updated_at DESC
+        LIMIT 10`,
+      company.params
+    );
+    return ok(res, { companyId: companyId || null, rows });
+  } catch (err) {
+    return fail(res, 500, 'Failed to fetch guard streaks.', err.message);
+  }
+});
+
+app.get('/api/enormity/operations/live', async (req, res) => {
+  try {
+    const companyId = req.query.companyId || '';
+    const company = companyWhere(companyId);
+    const rows = await query(
+      `SELECT history_id AS historyId,
+              companyid AS companyId,
+              deptid AS deptId,
+              deptname AS deptName,
+              guardid AS guardId,
+              guardname AS guardName,
+              siteid AS siteId,
+              sitename AS siteName,
+              sitecode AS siteCode,
+              readercode AS readerCode,
+              imei,
+              last_scan_time AS lastScanTime,
+              longitude,
+              latitude,
+              status,
+              minutes_since_scan AS minutesSinceScan
+         FROM v_live_operations
+        WHERE 1=1${company.clause}
+        ORDER BY last_scan_time DESC
+        LIMIT 500`,
+      company.params
+    );
+    return ok(res, { companyId: companyId || null, rows });
+  } catch (err) {
+    return fail(res, 500, 'Failed to fetch live operations.', err.message);
+  }
+});
+
+app.get('/api/enormity/cache/stats', async (req, res) => {
+  try {
+    const connected = await ensureRedis();
+    if (!connected) return ok(res, { connected: false, hitRate: 0, totalKeys: 0, memoryUsed: null, topKeys: [] });
+    const total = cacheCounters.hits + cacheCounters.misses;
+    const [dbSize, info, keys] = await Promise.all([
+      redis.dbsize(),
+      redis.info('memory'),
+      redis.keys('*').then((items) => items.slice(0, 25)),
+    ]);
+    const memoryLine = String(info).split('\n').find((line) => line.startsWith('used_memory_human:')) || '';
+    return ok(res, {
+      connected: true,
+      hits: cacheCounters.hits,
+      misses: cacheCounters.misses,
+      hitRate: total ? Number(((cacheCounters.hits / total) * 100).toFixed(2)) : 0,
+      totalKeys: dbSize,
+      memoryUsed: memoryLine.split(':')[1]?.trim() || null,
+      topKeys: keys,
+    });
+  } catch (err) {
+    return fail(res, 500, 'Failed to read Redis cache stats.', err.message);
+  }
+});
+
+app.post('/api/enormity/alerts/:id/acknowledge', async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id, 0);
+    if (!id) return fail(res, 400, 'Invalid escalation id.');
+    const acknowledgedBy = req.enormityAuth?.subject || req.body?.acknowledgedBy || 'nexus-api';
+    await query(
+      `UPDATE enormity_escalations
+          SET requiresAck = 0,
+              status = 'ACKNOWLEDGED',
+              acknowledged_at = NOW(),
+              acknowledged_by = ?
+        WHERE escalation_id = ?`,
+      [acknowledgedBy, id]
+    );
+    await query(
+      `INSERT INTO enormity_audit_log (event_type, user_name, endpoint, request_params, response_code, created_at)
+       VALUES ('alert_acknowledged', ?, '/api/enormity/alerts/:id/acknowledge', CAST(? AS JSON), 200, NOW())`,
+      [acknowledgedBy, JSON.stringify({ escalationId: id })]
+    );
+    return ok(res, { escalationId: id, acknowledgedBy });
+  } catch (err) {
+    return fail(res, 500, 'Failed to acknowledge escalation.', err.message);
   }
 });
 
@@ -624,10 +915,130 @@ app.post('/api/enormity/reports/kpm', async (req, res) => {
   }
 });
 
+const wsServer = http.createServer();
+const wss = new WebSocket.Server({ server: wsServer });
+let lastScanId = 0;
+let lastEscalationId = 0;
+
+function broadcast(event) {
+  const payload = JSON.stringify(event);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
+
+wss.on('connection', (socket) => {
+  socket.send(JSON.stringify({ event: 'CONNECTED', service: 'enormity-realtime', timestamp: timestamp() }));
+});
+
+async function initialiseRealtimeCursors() {
+  try {
+    const scanRows = await query('SELECT COALESCE(MAX(ID), 0) AS id FROM historydatas');
+    const escalationRows = await query('SELECT COALESCE(MAX(escalation_id), 0) AS id FROM enormity_escalations');
+    lastScanId = Number(scanRows[0]?.id || 0);
+    lastEscalationId = Number(escalationRows[0]?.id || 0);
+  } catch (err) {
+    console.error('realtime cursor init failed:', err.message);
+  }
+}
+
+async function pollPatrolScans() {
+  try {
+    const rows = await query(
+      `SELECT ID AS id,
+              GUARDNAME AS guardName,
+              SITENAME AS siteName,
+              HAPPENTIME AS happenTime,
+              LATITUDE AS latitude,
+              LONGITUDE AS longitude
+         FROM historydatas
+        WHERE ID > ?
+        ORDER BY ID ASC
+        LIMIT 100`,
+      [lastScanId]
+    );
+    for (const row of rows) {
+      lastScanId = Math.max(lastScanId, Number(row.id));
+      broadcast({
+        event: 'NEW_PATROL_SCAN',
+        guardName: row.guardName,
+        siteName: row.siteName,
+        happenTime: row.happenTime,
+        latitude: row.latitude === null ? null : Number(row.latitude),
+        longitude: row.longitude === null ? null : Number(row.longitude),
+      });
+    }
+  } catch (err) {
+    console.error('patrol scan poll failed:', err.message);
+  }
+}
+
+async function sendTelegramAlert(escalation) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const message = [
+    'SOS ALERT',
+    `Guard: ${escalation.guardName || 'Unknown'}`,
+    `Site: ${escalation.siteName || 'Unknown'}`,
+    `Company: ${escalation.companyId || 'Unknown'}`,
+    `Time: ${escalation.createdAt || timestamp()}`,
+    'Action required: Acknowledge at nexus.enormity.tech',
+  ].join('\n');
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: message,
+  }, { timeout: 5000 });
+}
+
+async function pollEscalations() {
+  try {
+    const rows = await query(
+      `SELECT escalation_id AS escalationId,
+              alarm_id AS alarmId,
+              companyid AS companyId,
+              alarm_type AS alarmType,
+              guard_name AS guardName,
+              site_name AS siteName,
+              severity,
+              status,
+              created_at AS createdAt
+         FROM enormity_escalations
+        WHERE escalation_id > ?
+           OR (requiresAck = 1 AND status = 'ACTIVE' AND severity = 'CRITICAL')
+        ORDER BY escalation_id ASC
+        LIMIT 100`,
+      [lastEscalationId]
+    );
+    for (const row of rows) {
+      lastEscalationId = Math.max(lastEscalationId, Number(row.escalationId));
+      broadcast({
+        event: 'NEW_ALARM',
+        alarmType: row.alarmType,
+        guardName: row.guardName,
+        severity: row.severity,
+        siteName: row.siteName,
+        createdAt: row.createdAt,
+      });
+      if (row.severity === 'CRITICAL' && !notifiedEscalations.has(row.escalationId)) {
+        notifiedEscalations.add(row.escalationId);
+        sendTelegramAlert(row).catch((err) => console.error('telegram alert failed:', err.message));
+      }
+    }
+  } catch (err) {
+    console.error('alarm poll failed:', err.message);
+  }
+}
+
 app.use((req, res) => {
   fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`);
 });
 
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
+});
+
+wsServer.listen(WS_PORT, '127.0.0.1', async () => {
+  await initialiseRealtimeCursors();
+  setInterval(pollPatrolScans, 10000);
+  setInterval(pollEscalations, 5000);
+  console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
 });

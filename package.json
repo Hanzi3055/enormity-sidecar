@@ -18,8 +18,10 @@
     "express": "^4.22.1",
     "express-rate-limit": "^8.3.2",
     "helmet": "^8.1.0",
+    "ioredis": "^5.10.1",
     "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.22.2",
-    "pdfkit": "^0.18.0"
+    "pdfkit": "^0.18.0",
+    "ws": "^8.20.0"
   }
 }

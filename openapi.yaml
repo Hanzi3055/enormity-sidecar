@@ -1,0 +1,199 @@
+openapi: 3.0.3
+info:
+  title: Enormity Nexus Sidecar API
+  version: 2.0.0
+servers:
+  - url: https://nexus.enormity.tech
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+paths:
+  /api/enormity/health:
+    get:
+      summary: Sidecar health check
+      responses:
+        '200':
+          description: OK
+  /api/enormity/status/overview:
+    get:
+      summary: Public status overview
+      responses:
+        '200':
+          description: OK
+  /api/enormity/status/containers:
+    get:
+      summary: Docker container snapshot
+      responses:
+        '200':
+          description: OK
+  /api/enormity/docs:
+    get:
+      summary: OpenAPI YAML document
+      responses:
+        '200':
+          description: OK
+  /api/enormity/auth/token:
+    post:
+      summary: Exchange API key for JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                apiKey:
+                  type: string
+      responses:
+        '200':
+          description: Token issued
+        '401':
+          description: Invalid API key
+  /api/enormity/patrol/summary:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Patrol summary }
+  /api/enormity/patrol/live:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Live patrol rows }
+  /api/enormity/patrol/missed:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          required: true
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Missed checkpoint analysis }
+  /api/enormity/operations/live:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+      responses:
+        '200': { description: Live operations view }
+  /api/enormity/analytics/heatmap:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+        - in: query
+          name: days
+          schema: { type: integer, minimum: 1, maximum: 90 }
+      responses:
+        '200': { description: Heatmap data }
+  /api/enormity/analytics/anomalies:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          required: true
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Anomaly result set }
+  /api/enormity/analytics/compliance:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          required: true
+          schema: { type: integer }
+        - in: query
+          name: month
+          schema: { type: integer, minimum: 1, maximum: 12 }
+        - in: query
+          name: year
+          schema: { type: integer, minimum: 2000 }
+      responses:
+        '200': { description: Compliance result set }
+  /api/enormity/guards/efficiency:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Guard efficiency list }
+  /api/enormity/guards/streaks:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+      responses:
+        '200': { description: Guard streak list }
+  /api/enormity/devices/status:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+      responses:
+        '200': { description: Device status list }
+  /api/enormity/cache/stats:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Redis cache stats }
+  /api/enormity/alerts/{id}/acknowledge:
+    post:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Escalation acknowledged }
+  /api/enormity/reports/pkk2/pdf:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: PDF stream }
+  /api/enormity/reports/pkk3/pdf:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: PDF stream }
+  /api/enormity/reports/pkk4/pdf:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: PDF stream }
+  /api/enormity/reports/bundle/pdf:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: ZIP stream }
