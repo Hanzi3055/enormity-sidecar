@@ -15,14 +15,30 @@ const Redis = require('ioredis');
 const axios = require('axios');
 const kpmEngine = require('./kpm-engine');
 
+process.on('uncaughtException', (err) => {
+  console.error('[Enormity] Uncaught exception:', err && err.message, err && err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Enormity] Unhandled rejection at:', promise, 'reason:', reason);
+});
+
 const app = express();
 const startedAt = Date.now();
 const PORT = Number(process.env.PORT || 3100);
 const WS_PORT = Number(process.env.WS_PORT || 3101);
-const JWT_SECRET = process.env.JWT_SECRET || 'change-me-before-production';
+const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
 const VALID_API_KEYS = String(process.env.ENORMITY_API_KEYS || '').split(',').map((key) => key.trim()).filter(Boolean);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT || '';
+
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is required for Enormity sidecar startup.');
+}
+
+if (VALID_API_KEYS.length === 0) {
+  throw new Error('ENORMITY_API_KEYS must contain at least one API key.');
+}
 
 const pool = mysql.createPool({
   host: process.env.MYSQL_HOST || '127.0.0.1',
@@ -47,12 +63,28 @@ const redis = new Redis({
 let redisReady = false;
 const cacheCounters = { hits: 0, misses: 0 };
 const notifiedEscalations = new Set();
+let shuttingDown = false;
 
 app.disable('x-powered-by');
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.setHeader('X-Powered-By', 'Enormity Tech Solutions');
+  res.setHeader('X-API-Version', '2.0.0');
+  const originalEnd = res.end;
+  res.end = function patchedEnd(...args) {
+    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+    if (!res.headersSent) {
+      res.setHeader('X-Response-Time', `${durationMs.toFixed(2)}ms`);
+    }
+    return originalEnd.apply(this, args);
+  };
+  next();
+});
 
 app.use((req, res, next) => {
   const start = process.hrtime.bigint();
@@ -74,16 +106,32 @@ function ok(res, data, status = 200) {
   return res.status(status).json({ success: true, data, timestamp: timestamp() });
 }
 
-function fail(res, status, message, details) {
+function fail(res, status, message, details, code) {
   const payload = { success: false, error: { message }, timestamp: timestamp() };
+  if (code) payload.error.code = code;
   if (details) payload.error.details = details;
   return res.status(status).json(payload);
+}
+
+function handleRouteError(res, route, err, fallbackMessage) {
+  console.error(`[Enormity] ${route} error:`, err && err.message, err && err.stack ? err.stack : '');
+  if (err && err.status && err.status < 500) {
+    return fail(res, err.status, fallbackMessage || err.message, err.message, err.code || 'E400');
+  }
+  return fail(res, 500, 'Internal server error', fallbackMessage || 'Request failed.', 'E001');
 }
 
 function parsePositiveInt(value, fallback, max) {
   const parsed = Number.parseInt(String(value || ''), 10);
   const safe = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   return max ? Math.min(safe, max) : safe;
+}
+
+function optionalCompanyId(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const parsed = parsePositiveInt(text, 0);
+  return parsed || null;
 }
 
 function todayString() {
@@ -111,6 +159,42 @@ function dateRange(date) {
 function currentMonthYear() {
   const now = new Date();
   return { month: now.getMonth() + 1, year: now.getFullYear() };
+}
+
+function formatUptime(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function memoryMb(value) {
+  return `${Math.round(Number(value || 0) / 1024 / 1024)}MB`;
+}
+
+function monthDateRange(month, year) {
+  const safeMonth = Math.max(1, Math.min(12, Number(month) || 1));
+  const safeYear = Math.max(2000, Number(year) || new Date().getFullYear());
+  const monthStart = new Date(safeYear, safeMonth - 1, 1);
+  const monthEnd = new Date(safeYear, safeMonth, 0);
+  const formatDate = (value) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+  return {
+    start: `${formatDate(monthStart)} 00:00:00`,
+    end: `${formatDate(monthEnd)} 23:59:59`,
+    daysInMonth: monthEnd.getDate(),
+  };
+}
+
+function gradeFromCompliance(rate) {
+  const numericRate = Number(rate || 0);
+  if (numericRate >= 90) return 'A';
+  if (numericRate >= 80) return 'B';
+  if (numericRate >= 70) return 'C';
+  if (numericRate >= 60) return 'D';
+  return 'F';
 }
 
 function companyWhere(companyId, alias) {
@@ -180,6 +264,38 @@ async function checkDatabase() {
   return rows[0] && rows[0].ok === 1;
 }
 
+async function getRedisHealth() {
+  const start = Date.now();
+  const connected = await ensureRedis();
+  if (!connected) {
+    return { connected: false, latencyMs: null };
+  }
+  try {
+    await redis.ping();
+    return { connected: true, latencyMs: Date.now() - start };
+  } catch (_) {
+    redisReady = false;
+    return { connected: false, latencyMs: null };
+  }
+}
+
+async function getPatrolStats(date) {
+  const [start, end] = dateRange(date);
+  const rows = await query(
+    `SELECT
+        (SELECT COUNT(*) FROM historydatas) AS totalRecords,
+        SUM(CASE WHEN HAPPENTIME BETWEEN ? AND ? THEN 1 ELSE 0 END) AS todayRecords,
+        COUNT(DISTINCT CASE WHEN HAPPENTIME BETWEEN ? AND ? THEN GUARDID END) AS activeGuards
+       FROM historydatas`,
+    [start, end, start, end]
+  );
+  return {
+    totalRecords: Number(rows[0]?.totalRecords || 0),
+    todayRecords: Number(rows[0]?.todayRecords || 0),
+    activeGuards: Number(rows[0]?.activeGuards || 0),
+  };
+}
+
 let auditReady = false;
 
 function clientIp(req) {
@@ -226,9 +342,19 @@ async function auditRequest(req, res, durationMs) {
     await ensureAuditTable();
     const params = JSON.stringify({ query: req.query || {}, body: sanitizeAuditBody(req.body || {}) });
     await query(
-      `INSERT INTO enormity_audit_log (event_type, ip_address, success, reason, endpoint, request_params, response_code, response_time_ms, created_at)
-       VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, NOW())`,
-      [req.enormityAuth ? 'sidecar_authenticated_request' : 'sidecar_public_request', clientIp(req), res.statusCode < 400 ? 1 : 0, req.enormityAuth?.subject || null, req.originalUrl.split('?')[0], params, res.statusCode, Math.round(durationMs)]
+      `INSERT INTO enormity_audit_log (event_type, user_name, ip_address, success, reason, endpoint, request_params, response_code, response_time_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, NOW())`,
+      [
+        req.enormityAuth ? 'sidecar_authenticated_request' : 'sidecar_public_request',
+        req.enormityAuth?.subject || null,
+        clientIp(req),
+        res.statusCode < 400 ? 1 : 0,
+        res.statusCode < 400 ? null : 'request_failed',
+        req.originalUrl.split('?')[0],
+        params,
+        res.statusCode,
+        Math.round(durationMs)
+      ]
     );
   } catch (err) {
     if (!/command denied|INSERT command denied/i.test(err.message)) throw err;
@@ -256,8 +382,10 @@ function authenticateJwt(req, res, next) {
 }
 
 function requireApiKey(req, res) {
-  const apiKey = req.body?.apiKey;
-  if (!apiKey || !VALID_API_KEYS.includes(apiKey)) {
+  const rawApiKey = String(req.body?.apiKey || '').trim();
+  const providedKeys = rawApiKey.split(',').map((item) => item.trim()).filter(Boolean);
+  const matchedKey = providedKeys.find((candidate) => VALID_API_KEYS.includes(candidate));
+  if (!matchedKey) {
     return fail(res, 401, 'Invalid API key.');
   }
   const token = jwt.sign({ subject: 'enormity-sidecar-client', scope: 'api:enormity' }, JWT_SECRET, { expiresIn: '24h' });
@@ -268,11 +396,25 @@ function requireApiKey(req, res) {
 app.get('/api/enormity/health', async (req, res) => {
   const dbStart = Date.now();
   try {
-    const databaseConnected = await checkDatabase();
+    const date = todayString();
+    const [databaseConnected, redisHealth, patrolStats] = await Promise.all([
+      checkDatabase(),
+      getRedisHealth(),
+      getPatrolStats(date),
+    ]);
+    const memoryUsage = process.memoryUsage();
+    const uptimeSeconds = Math.floor(process.uptime());
     return ok(res, {
       service: 'enormity-sidecar',
-      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-      memory: process.memoryUsage(),
+      version: '3.0.0',
+      environment: process.env.NODE_ENV || 'production',
+      uptimeSeconds,
+      uptimeHuman: formatUptime(uptimeSeconds),
+      memory: {
+        rss: memoryMb(memoryUsage.rss),
+        heapUsed: memoryMb(memoryUsage.heapUsed),
+        heapTotal: memoryMb(memoryUsage.heapTotal),
+      },
       database: {
         connected: databaseConnected,
         host: process.env.MYSQL_HOST || '127.0.0.1',
@@ -280,11 +422,59 @@ app.get('/api/enormity/health', async (req, res) => {
         database: process.env.MYSQL_DATABASE || 'cloudpatrol',
         latencyMs: Date.now() - dbStart,
       },
+      redis: redisHealth,
+      patrolStats,
       node: process.version,
       timestamp: timestamp(),
     });
   } catch (err) {
-    return fail(res, 503, 'Database health check failed.', err.message);
+    return handleRouteError(res, '/api/enormity/health', err, 'Database health check failed.');
+  }
+});
+
+app.get('/api/enormity/health/db', async (req, res) => {
+  try {
+    const [[sizeRow], [statusRow], tables, enormityTables, procedures, triggers, views, [activityRow]] = await Promise.all([
+      query(`SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS dbSizeMb FROM information_schema.TABLES WHERE table_schema = DATABASE()`),
+      query(`SHOW GLOBAL STATUS LIKE 'Uptime'`),
+      query(`SELECT 'historydatas' AS tableName, COUNT(*) AS rowCount FROM historydatas
+             UNION ALL SELECT 'alarmdatas', COUNT(*) FROM alarmdatas
+             UNION ALL SELECT 'guards', COUNT(*) FROM guards
+             UNION ALL SELECT 'sites', COUNT(*) FROM sites`),
+      query(`SELECT 'enormity_audit_log' AS tableName, COUNT(*) AS rowCount FROM enormity_audit_log
+             UNION ALL SELECT 'enormity_escalations', COUNT(*) FROM enormity_escalations
+             UNION ALL SELECT 'enormity_guard_streaks', COUNT(*) FROM enormity_guard_streaks`),
+      query(`SHOW PROCEDURE STATUS WHERE Db = DATABASE() AND Name LIKE 'sp\\_%'`),
+      query(`SHOW TRIGGERS FROM cloudpatrol`),
+      query(`SHOW FULL TABLES WHERE Table_type = 'VIEW' AND Tables_in_cloudpatrol LIKE 'v\\_%'`),
+      query(`SELECT
+               SUM(CASE WHEN HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) AS scansLastHour,
+               SUM(CASE WHEN DATE(HAPPENTIME) = CURDATE() THEN 1 ELSE 0 END) AS scansToday,
+               (SELECT COUNT(*) FROM alarmdatas WHERE DATE(HAPPENTIME) = CURDATE()) AS alarmsToday
+             FROM historydatas`)
+    ]);
+
+    const tableCounts = {};
+    tables.forEach((row) => { tableCounts[row.tableName] = Number(row.rowCount || 0); });
+    const enormityCounts = {};
+    enormityTables.forEach((row) => { enormityCounts[row.tableName] = Number(row.rowCount || 0); });
+
+    return ok(res, {
+      tables: tableCounts,
+      enormityTables: enormityCounts,
+      procedures: procedures.map((row) => row.Name),
+      triggers: triggers.map((row) => row.Trigger),
+      views: views.map((row) => Object.values(row)[0]),
+      recentActivity: {
+        scansLastHour: Number(activityRow.scansLastHour || 0),
+        scansToday: Number(activityRow.scansToday || 0),
+        alarmsToday: Number(activityRow.alarmsToday || 0),
+      },
+      dbSize: `${Number(sizeRow.dbSizeMb || 0).toFixed(2)} MB`,
+      uptime: `${Math.round(Number(statusRow.Value || 0) / 3600)} hours`,
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/health/db', err, 'Failed to build database health report.');
   }
 });
 
@@ -303,7 +493,11 @@ app.get('/api/enormity/status/overview', async (req, res) => {
       ),
       query(`SHOW PROCEDURE STATUS WHERE Db = DATABASE() AND Name LIKE 'sp\\_%'`),
       query(`SHOW FULL TABLES WHERE Table_type = 'VIEW' AND Tables_in_cloudpatrol LIKE 'v\\_%'`),
-      query(`SHOW TABLES LIKE 'enormity\\_%'`),
+      query(`SELECT TABLE_NAME AS tableName, TABLE_ROWS AS rowCount
+               FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME LIKE 'enormity\\_%'
+              ORDER BY TABLE_NAME`),
     ]);
     return ok(res, {
       date,
@@ -312,10 +506,14 @@ app.get('/api/enormity/status/overview', async (req, res) => {
       activeSites: Number(totals[0]?.activeSites || 0),
       procedures: procedures.map((row) => row.Name),
       views: views.map((row) => Object.values(row)[0]),
-      tables: tables.map((row) => Object.values(row)[0]),
+      tables: tables.map((row) => row.tableName),
+      tableRows: tables.map((row) => ({
+        tableName: row.tableName,
+        rowCount: Number(row.rowCount || 0),
+      })),
     });
   } catch (err) {
-    return fail(res, 500, 'Failed to build status overview.', err.message);
+    return handleRouteError(res, '/api/enormity/status/overview', err, 'Failed to build status overview.');
   }
 });
 
@@ -328,7 +526,7 @@ app.get('/api/enormity/status/containers', (req, res) => {
     });
     return ok(res, { rows });
   } catch (err) {
-    return fail(res, 500, 'Failed to read docker container status.', err.message);
+    return handleRouteError(res, '/api/enormity/status/containers', err, 'Failed to read docker container status.');
   }
 });
 
@@ -339,12 +537,62 @@ app.get('/api/enormity/docs', (req, res) => {
   res.type('text/yaml');
   return res.send(fs.readFileSync(specPath, 'utf8'));
 });
+
+app.get('/api/enormity/company/list', async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT COMPANYID AS id,
+              COMPANYNAME AS companyName,
+              COMPANYCODE AS companyCode
+         FROM companys
+        WHERE IFNULL(IS_Effective, 1) <> 0
+        ORDER BY COMPANYNAME ASC`
+    );
+    return ok(res, rows);
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/company/list', err, 'Failed to fetch company list.');
+  }
+});
+
 app.use('/api/enormity', authenticateJwt);
+
+app.get('/api/enormity/audit/logs', async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 7, 90);
+    const limit = parsePositiveInt(req.query.limit, 100, 500);
+    const eventType = String(req.query.eventType || '').trim();
+    const params = [days];
+    let sql = `SELECT id, event_type, endpoint, user_name, ip_address, success, response_code, response_time_ms, reason, created_at
+                 FROM enormity_audit_log
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+    if (eventType) {
+      sql += ' AND event_type = ?';
+      params.push(eventType);
+    }
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+    const rows = await query(sql, params);
+    return ok(res, rows.map((row) => ({
+      id: row.id,
+      eventType: row.event_type,
+      endpoint: row.endpoint,
+      userName: row.user_name,
+      ipAddress: row.ip_address,
+      success: row.success === null ? null : Boolean(row.success),
+      responseCode: row.response_code,
+      responseTimeMs: row.response_time_ms,
+      notes: row.reason,
+      createdAt: row.created_at,
+    })));
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/audit/logs', err, 'Failed to fetch audit logs.');
+  }
+});
 
 app.get('/api/enormity/patrol/summary', async (req, res) => {
   try {
     const date = validateDateParam(req.query.date);
-    const companyId = req.query.companyId || '';
+    const companyId = optionalCompanyId(req.query.companyId);
     const cacheKey = `patrol:summary:${companyId || 'all'}:${date}`;
     const cached = await getCachedJson(cacheKey);
     if (cached) {
@@ -353,8 +601,18 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
     }
     const [start, end] = dateRange(date);
     const company = companyWhere(companyId);
+    const scheduleParams = [date];
+    let expectedScansSql = `SELECT COUNT(*) AS expectedScans
+                              FROM schedules s
+                              INNER JOIN plans p ON p.PLANID = s.PLANID
+                              INNER JOIN depts d ON d.DEPTID = p.DEPTID
+                             WHERE DATE(?) BETWEEN DATE(p.BEGINDATE) AND DATE(p.ENDDATE)`;
+    if (companyId) {
+      expectedScansSql += ' AND d.COMPANYID = ?';
+      scheduleParams.push(companyId);
+    }
 
-    const [totals, hourlyRows, topGuards, topSites] = await Promise.all([
+    const [totals, hourlyRows, topGuards, topSites, scanWindow, expectedRows] = await Promise.all([
       query(
         `SELECT COUNT(*) AS totalScans,
                 COUNT(DISTINCT GUARDID) AS activeGuards,
@@ -389,6 +647,14 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
           LIMIT 5`,
         [start, end, ...company.params]
       ),
+      query(
+        `SELECT MIN(HAPPENTIME) AS firstScanTime,
+                MAX(HAPPENTIME) AS lastScanTime
+           FROM historydatas
+          WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}`,
+        [start, end, ...company.params]
+      ),
+      query(expectedScansSql, scheduleParams),
     ]);
 
     const hourlyMap = new Map(hourlyRows.map((row) => [Number(row.hour), Number(row.count)]));
@@ -396,13 +662,26 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
       hour,
       count: hourlyMap.get(hour) || 0,
     }));
+    const peakHourRow = hourlyBreakdown.reduce((best, current) => (
+      current.count > best.count ? current : best
+    ), { hour: null, count: -1 });
+    const totalScans = Number(totals[0].totalScans || 0);
+    const activeGuards = Number(totals[0].activeGuards || 0);
+    const activeSites = Number(totals[0].activeSites || 0);
+    const expectedScans = Number(expectedRows[0]?.expectedScans || 0);
 
     const payload = {
       date,
       companyId: companyId || null,
-      totalScans: Number(totals[0].totalScans || 0),
-      activeGuards: Number(totals[0].activeGuards || 0),
-      activeSites: Number(totals[0].activeSites || 0),
+      totalScans,
+      activeGuards,
+      activeSites,
+      expectedScans: expectedScans || null,
+      complianceRate: expectedScans > 0 ? Number(((totalScans / expectedScans) * 100).toFixed(2)) : null,
+      peakHour: peakHourRow.count >= 0 ? peakHourRow.hour : null,
+      firstScanTime: scanWindow[0]?.firstScanTime || null,
+      lastScanTime: scanWindow[0]?.lastScanTime || null,
+      avgScansPerGuard: activeGuards > 0 ? Number((totalScans / activeGuards).toFixed(2)) : 0,
       hourlyBreakdown,
       topGuards: topGuards.map((row) => ({
         guardId: row.guardId,
@@ -419,7 +698,7 @@ app.get('/api/enormity/patrol/summary', async (req, res) => {
     await setCachedJson(cacheKey, 300, payload);
     return ok(res, payload);
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to build patrol summary.', err.message);
+    return handleRouteError(res, '/api/enormity/patrol/summary', err, 'Failed to build patrol summary.');
   }
 });
 
@@ -458,7 +737,7 @@ app.get('/api/enormity/patrol/live', async (req, res) => {
       status: row.status,
     })));
   } catch (err) {
-    return fail(res, 500, 'Failed to fetch live patrol records.', err.message);
+    return handleRouteError(res, '/api/enormity/patrol/live', err, 'Failed to fetch live patrol records.');
   }
 });
 
@@ -512,7 +791,7 @@ app.get('/api/enormity/guards/efficiency', async (req, res) => {
     await setCachedJson(cacheKey, 300, payload);
     return ok(res, payload);
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to compute guard efficiency.', err.message);
+    return handleRouteError(res, '/api/enormity/guards/efficiency', err, 'Failed to compute guard efficiency.');
   }
 });
 
@@ -542,7 +821,7 @@ app.get('/api/enormity/devices/status', async (req, res) => {
       licenceExpiry: row.licenceExpiry,
     })));
   } catch (err) {
-    return fail(res, 500, 'Failed to fetch device status.', err.message);
+    return handleRouteError(res, '/api/enormity/devices/status', err, 'Failed to fetch device status.');
   }
 });
 
@@ -568,7 +847,7 @@ app.get('/api/enormity/analytics/heatmap', async (req, res) => {
       count: Number(row.count),
     })));
   } catch (err) {
-    return fail(res, 500, 'Failed to build analytics heatmap.', err.message);
+    return handleRouteError(res, '/api/enormity/analytics/heatmap', err, 'Failed to build analytics heatmap.');
   }
 });
 
@@ -579,7 +858,7 @@ app.get('/api/enormity/patrol/missed', async (req, res) => {
     const rows = firstResultSet(await query('CALL sp_missed_checkpoints(?, ?)', [companyId, date]));
     return ok(res, { companyId, date, rows });
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to fetch missed checkpoint analysis.', err.message);
+    return handleRouteError(res, '/api/enormity/patrol/missed', err, 'Failed to fetch missed checkpoint analysis.');
   }
 });
 
@@ -590,7 +869,7 @@ app.get('/api/enormity/analytics/anomalies', async (req, res) => {
     const rows = firstResultSet(await query('CALL sp_anomaly_detection(?, ?)', [companyId, date]));
     return ok(res, { companyId, date, rows });
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to fetch anomaly analysis.', err.message);
+    return handleRouteError(res, '/api/enormity/analytics/anomalies', err, 'Failed to fetch anomaly analysis.');
   }
 });
 
@@ -607,7 +886,7 @@ app.get('/api/enormity/analytics/compliance', async (req, res) => {
       return { companyId, month, year, rows };
     });
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to fetch compliance report.', err.message);
+    return handleRouteError(res, '/api/enormity/analytics/compliance', err, 'Failed to fetch compliance report.');
   }
 });
 
@@ -631,7 +910,160 @@ app.get('/api/enormity/guards/streaks', async (req, res) => {
     );
     return ok(res, { companyId: companyId || null, rows });
   } catch (err) {
-    return fail(res, 500, 'Failed to fetch guard streaks.', err.message);
+    return handleRouteError(res, '/api/enormity/guards/streaks', err, 'Failed to fetch guard streaks.');
+  }
+});
+
+app.get('/api/enormity/guards/leaderboard', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const { month, year } = parseMonthYear(req);
+    const limit = parsePositiveInt(req.query.limit, 10, 100);
+    const rows = firstResultSet(await query('CALL sp_guard_leaderboard_monthly(?, ?, ?)', [companyId, month, year]));
+    return ok(res, { companyId, month, year, limit, rows: rows.slice(0, limit) });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/guards/leaderboard', err, 'Failed to fetch monthly guard leaderboard.');
+  }
+});
+
+app.get('/api/enormity/guards/idle', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const params = [];
+    let sql = `SELECT g.GUARDID AS guardId,
+                      g.GUARDNAME AS guardName,
+                      d.COMPANYID AS companyId,
+                      g.DEPTID AS deptId
+                 FROM guards g
+            LEFT JOIN depts d ON d.DEPTID = g.DEPTID
+                WHERE g.GUARDID NOT IN (
+                        SELECT DISTINCT GUARDID
+                          FROM historydatas
+                         WHERE DATE(HAPPENTIME) = CURDATE()
+                           AND GUARDID IS NOT NULL
+                     )`;
+    if (companyId) {
+      sql += ' AND d.COMPANYID = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY g.GUARDNAME ASC LIMIT 200';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/guards/idle', err, 'Failed to fetch idle guards.');
+  }
+});
+
+app.get('/api/enormity/guards/history', async (req, res) => {
+  try {
+    const guardId = parsePositiveInt(req.query.guardId, 0);
+    if (!guardId) return fail(res, 400, 'guardId is required.');
+    const days = parsePositiveInt(req.query.days, 30, 90);
+    const rows = await query(
+      `SELECT DATE(HAPPENTIME) AS patrolDate,
+              COUNT(*) AS scans
+         FROM historydatas
+        WHERE GUARDID = ?
+          AND HAPPENTIME >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        GROUP BY DATE(HAPPENTIME)
+        ORDER BY patrolDate DESC`,
+      [guardId, days]
+    );
+    return ok(res, { guardId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/guards/history', err, 'Failed to fetch guard scan history.');
+  }
+});
+
+app.get('/api/enormity/sites/coverage', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const date = validateDateParam(req.query.date);
+    const rows = firstResultSet(await query('CALL sp_site_patrol_coverage(?, ?)', [companyId, date]));
+    return ok(res, { companyId, date, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/sites/coverage', err, 'Failed to fetch site patrol coverage.');
+  }
+});
+
+app.get('/api/enormity/sites/top-missed', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const days = parsePositiveInt(req.query.days, 30, 90);
+    const params = [days];
+    let sql = `SELECT SITEID AS siteId,
+                      SITENAME AS siteName,
+                      COUNT(*) AS missedCount,
+                      MAX(HAPPENTIME) AS lastMissed,
+                      CASE
+                        WHEN COUNT(*) >= 10 THEN 'CRITICAL'
+                        WHEN COUNT(*) >= 5 THEN 'HIGH'
+                        WHEN COUNT(*) >= 2 THEN 'MEDIUM'
+                        ELSE 'LOW'
+                      END AS severity
+                 FROM alarmdatas
+                WHERE ALARMTYPE = 3
+                  AND HAPPENTIME >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+    if (companyId) {
+      sql += ' AND COMPANYID = ?';
+      params.push(companyId);
+    }
+    sql += ' GROUP BY SITEID, SITENAME ORDER BY missedCount DESC, lastMissed DESC LIMIT 20';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/sites/top-missed', err, 'Failed to fetch top missed sites.');
+  }
+});
+
+app.get('/api/enormity/reports/scorecard', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const date = validateDateParam(req.query.date);
+    const rows = firstResultSet(await query('CALL sp_daily_kpm_scorecard(?, ?)', [companyId, date]));
+    return ok(res, { companyId, date, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/reports/scorecard', err, 'Failed to fetch daily KPM scorecard.');
+  }
+});
+
+app.get('/api/enormity/devices/expiring', async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, 365);
+    const companyId = optionalCompanyId(req.query.companyId);
+    const params = [days];
+    let sql = `SELECT readerCode, readerName, companyName, licenceExpiry, daysRemaining, licenceStatus
+                 FROM v_device_licence_status
+                WHERE daysRemaining <= ?`;
+    if (companyId) {
+      sql += ' AND companyId = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY daysRemaining ASC, readerCode ASC';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/devices/expiring', err, 'Failed to fetch expiring devices.');
+  }
+});
+
+app.get('/api/enormity/alarms/summary', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const days = parsePositiveInt(req.query.days, 30, 90);
+    const params = [days];
+    let sql = `SELECT companyId, companyName, alarmDate, alarmType, alarmTypeName, alarmCount, resolvedCount, pendingCount
+                 FROM v_alarm_summary
+                WHERE alarmDate >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`;
+    if (companyId) {
+      sql += ' AND companyId = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY alarmDate DESC, alarmCount DESC LIMIT 200';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/alarms/summary', err, 'Failed to fetch alarm summary.');
   }
 });
 
@@ -664,7 +1096,7 @@ app.get('/api/enormity/operations/live', async (req, res) => {
     );
     return ok(res, { companyId: companyId || null, rows });
   } catch (err) {
-    return fail(res, 500, 'Failed to fetch live operations.', err.message);
+    return handleRouteError(res, '/api/enormity/operations/live', err, 'Failed to fetch live operations.');
   }
 });
 
@@ -689,7 +1121,35 @@ app.get('/api/enormity/cache/stats', async (req, res) => {
       topKeys: keys,
     });
   } catch (err) {
-    return fail(res, 500, 'Failed to read Redis cache stats.', err.message);
+    return handleRouteError(res, '/api/enormity/cache/stats', err, 'Failed to read Redis cache stats.');
+  }
+});
+
+app.get('/api/enormity/alerts/unacknowledged', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const limit = parsePositiveInt(req.query.limit, 100, 500);
+    const params = [];
+    let sql = `SELECT escalation_id AS id,
+                      alarm_type AS alarmType,
+                      severity AS escalationLevel,
+                      companyid AS companyId,
+                      guard_name AS guardName,
+                      site_name AS siteName,
+                      created_at AS createdAt,
+                      TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS minutesOpen
+                 FROM enormity_escalations
+                WHERE requiresAck = 1`;
+    if (companyId) {
+      sql += ' AND companyid = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+    const rows = await query(sql, params);
+    return ok(res, { companyId, limit, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/alerts/unacknowledged', err, 'Failed to fetch unacknowledged alerts.');
   }
 });
 
@@ -714,7 +1174,7 @@ app.post('/api/enormity/alerts/:id/acknowledge', async (req, res) => {
     );
     return ok(res, { escalationId: id, acknowledgedBy });
   } catch (err) {
-    return fail(res, 500, 'Failed to acknowledge escalation.', err.message);
+    return handleRouteError(res, '/api/enormity/alerts/:id/acknowledge', err, 'Failed to acknowledge escalation.');
   }
 });
 
@@ -749,21 +1209,35 @@ async function pkk2Rows(companyId, month, year) {
   try {
     const rows = await query('CALL sp_company_compliance_report(?, ?, ?)', [companyId, month, year]);
     const data = Array.isArray(rows[0]) ? rows[0] : rows;
+    const readCompliance = (row) => Number(row.complianceRate || row.compliance_rate || row.PeratusanPematuhan || row.compliance || 0);
     return data.map((row, index) => ({
       bil: index + 1,
       companyName: row.companyName || row.company_name || row.NamaSyarikat || row.COMPANYNAME || `Company ${companyId}`,
       approvedGuards: row.approvedGuards || row.approved_guards || row.BilanganPengawalDiluluskan || row.approved || '-',
       guardsOnDuty: row.guardsOnDuty || row.guards_on_duty || row.BilanganPengawalBertugas || row.activeGuards || '-',
       siteCount: row.siteCount || row.site_count || row.BilanganTapakKawalan || row.activeSites || '-',
-      complianceRate: `${Number(row.complianceRate || row.compliance_rate || row.PeratusanPematuhan || row.compliance || 0).toFixed(2)}%`,
+      complianceRate: `${readCompliance(row).toFixed(2)}%`,
+      kpmGrade: gradeFromCompliance(readCompliance(row)),
     }));
   } catch (_) {
-    const start = `${year}-${String(month).padStart(2, '0')}-01 00:00:00`;
-    const end = `${year}-${String(month).padStart(2, '0')}-31 23:59:59`;
+    const { start, end, daysInMonth } = monthDateRange(month, year);
     const company = companyWhere(companyId);
     const rows = await query(`SELECT COUNT(DISTINCT GUARDID) AS guardsOnDuty, COUNT(DISTINCT SITEID) AS siteCount, COUNT(*) AS scans FROM historydatas WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}`, [start, end, ...company.params]);
     const row = rows[0] || {};
-    return [{ bil: 1, companyName: await companyName(companyId), approvedGuards: row.guardsOnDuty || 0, guardsOnDuty: row.guardsOnDuty || 0, siteCount: row.siteCount || 0, complianceRate: row.scans > 0 ? '100.00%' : '0.00%' }];
+    const guardsOnDuty = Number(row.guardsOnDuty || 0);
+    const siteCount = Number(row.siteCount || 0);
+    const scans = Number(row.scans || 0);
+    const expectedActivity = Math.max(guardsOnDuty, siteCount, 1) * daysInMonth;
+    const complianceRate = Math.min(100, expectedActivity > 0 ? (scans / expectedActivity) * 100 : 0);
+    return [{
+      bil: 1,
+      companyName: await companyName(companyId),
+      approvedGuards: guardsOnDuty,
+      guardsOnDuty,
+      siteCount,
+      complianceRate: `${complianceRate.toFixed(2)}%`,
+      kpmGrade: gradeFromCompliance(complianceRate),
+    }];
   }
 }
 
@@ -782,8 +1256,43 @@ async function pkk3Rows(companyId, date) {
 async function pkk4Rows(companyId, date) {
   const [start, end] = dateRange(date);
   const company = companyWhere(companyId, 'h');
-  const rows = await query(`SELECT h.GUARDNAME AS guardName, COALESCE(g.GUARDCODE, h.GUARDID) AS guardCode, h.SITENAME AS siteName, h.HAPPENTIME AS patrolTime, CASE WHEN h.STATUS = 1 THEN 'SELESAI' ELSE 'SEMAKAN' END AS status, COALESCE(h.EVENTINFO, h.REMARK, '') AS remarks FROM historydatas h LEFT JOIN guards g ON g.GUARDID = h.GUARDID WHERE h.HAPPENTIME BETWEEN ? AND ?${company.clause} ORDER BY h.HAPPENTIME ASC LIMIT 1000`, [start, end, ...company.params]);
+  const rows = await query(`SELECT h.GUARDNAME AS guardName, COALESCE(g.GUARDCODE, h.GUARDID) AS guardCode, h.SITENAME AS siteName, h.HAPPENTIME AS patrolTime, CASE WHEN h.STATUS = 1 THEN 'SELESAI' ELSE 'SEMAKAN' END AS status, h.READERCODE AS deviceCode, COALESCE(h.EVENTINFO, h.REMARK, '') AS remarks FROM historydatas h LEFT JOIN guards g ON g.GUARDID = h.GUARDID WHERE h.HAPPENTIME BETWEEN ? AND ?${company.clause} ORDER BY h.HAPPENTIME ASC LIMIT 1000`, [start, end, ...company.params]);
   return rows.map((row, index) => ({ bil: index + 1, ...row }));
+}
+
+async function dailyScorecardPayload(companyId, date) {
+  const scorecardRows = firstResultSet(await query('CALL sp_daily_kpm_scorecard(?, ?)', [companyId, date]));
+  const scorecard = scorecardRows[0] || {};
+  const [start, end] = dateRange(date);
+  const company = companyWhere(companyId);
+  const [topGuards, sosAlerts] = await Promise.all([
+    query(
+      `SELECT GUARDID AS guardId, GUARDNAME AS guardName, COUNT(*) AS totalScans
+         FROM historydatas
+        WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}
+        GROUP BY GUARDID, GUARDNAME
+        ORDER BY totalScans DESC
+        LIMIT 3`,
+      [start, end, ...company.params]
+    ),
+    query(
+      `SELECT ID AS alarmId, GUARDNAME AS guardName, SITENAME AS siteName, HAPPENTIME AS happenTime
+         FROM alarmdatas
+        WHERE ALARMTYPE = 1
+          AND DATE(HAPPENTIME) = ?
+          AND PUSHED = 0${companyId ? ' AND COMPANYID = ?' : ''}
+        ORDER BY HAPPENTIME DESC
+        LIMIT 20`,
+      companyId ? [date, companyId] : [date]
+    ),
+  ]);
+  return {
+    companyName: await companyName(companyId),
+    date,
+    scorecard,
+    topGuards,
+    unresolvedSos: sosAlerts,
+  };
 }
 
 app.get('/api/enormity/reports/pkk2/pdf', async (req, res) => {
@@ -792,7 +1301,7 @@ app.get('/api/enormity/reports/pkk2/pdf', async (req, res) => {
     const { month, year } = parseMonthYear(req);
     const buffer = await kpmEngine.pkk2({ companyName: await companyName(companyId), month, year, rows: await pkk2Rows(companyId, month, year) });
     return sendPdf(res, `PKK2_${year}_${String(month).padStart(2, '0')}.pdf`, buffer);
-  } catch (err) { return fail(res, err.status || 500, 'Failed to generate PKK 2 PDF.', err.message); }
+  } catch (err) { return handleRouteError(res, '/api/enormity/reports/pkk2/pdf', err, 'Failed to generate PKK 2 PDF.'); }
 });
 
 app.get('/api/enormity/reports/pkk3/pdf', async (req, res) => {
@@ -801,7 +1310,7 @@ app.get('/api/enormity/reports/pkk3/pdf', async (req, res) => {
     const date = validateDateParam(req.query.date);
     const buffer = await kpmEngine.pkk3({ companyName: await companyName(companyId), date, rows: await pkk3Rows(companyId, date) });
     return sendPdf(res, `PKK3_${date}.pdf`, buffer);
-  } catch (err) { return fail(res, err.status || 500, 'Failed to generate PKK 3 PDF.', err.message); }
+  } catch (err) { return handleRouteError(res, '/api/enormity/reports/pkk3/pdf', err, 'Failed to generate PKK 3 PDF.'); }
 });
 
 app.get('/api/enormity/reports/pkk4/pdf', async (req, res) => {
@@ -810,7 +1319,7 @@ app.get('/api/enormity/reports/pkk4/pdf', async (req, res) => {
     const date = validateDateParam(req.query.date);
     const buffer = await kpmEngine.pkk4({ companyName: await companyName(companyId), date, rows: await pkk4Rows(companyId, date) });
     return sendPdf(res, `PKK4_${date}.pdf`, buffer);
-  } catch (err) { return fail(res, err.status || 500, 'Failed to generate PKK 4 PDF.', err.message); }
+  } catch (err) { return handleRouteError(res, '/api/enormity/reports/pkk4/pdf', err, 'Failed to generate PKK 4 PDF.'); }
 });
 
 app.get('/api/enormity/reports/bundle/pdf', async (req, res) => {
@@ -829,7 +1338,18 @@ app.get('/api/enormity/reports/bundle/pdf', async (req, res) => {
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="KPM_REPORT_BUNDLE_${date}.zip"`);
     return kpmEngine.bundle(res, files);
-  } catch (err) { return fail(res, err.status || 500, 'Failed to generate KPM PDF bundle.', err.message); }
+  } catch (err) { return handleRouteError(res, '/api/enormity/reports/bundle/pdf', err, 'Failed to generate KPM PDF bundle.'); }
+});
+
+app.get('/api/enormity/reports/daily-scorecard', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const date = validateDateParam(req.query.date);
+    const buffer = await kpmEngine.dailyScorecard(await dailyScorecardPayload(companyId, date));
+    return sendPdf(res, `DAILY_SCORECARD_${date}.pdf`, buffer);
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/reports/daily-scorecard', err, 'Failed to generate daily scorecard PDF.');
+  }
 });
 
 app.post('/api/enormity/reports/kpm', async (req, res) => {
@@ -911,7 +1431,46 @@ app.post('/api/enormity/reports/kpm', async (req, res) => {
       })),
     });
   } catch (err) {
-    return fail(res, err.status || 500, 'Failed to build KPM report data.', err.message);
+    return handleRouteError(res, '/api/enormity/reports/kpm', err, 'Failed to build KPM report data.');
+  }
+});
+
+app.post('/api/enormity/devices/:readerCode/notes', async (req, res) => {
+  try {
+    const readerCode = String(req.params.readerCode || '').trim();
+    const note = String(req.body?.note || '').trim();
+    const noteType = String(req.body?.noteType || 'GENERAL').trim().toUpperCase();
+    const addedBy = String(req.body?.addedBy || req.enormityAuth?.subject || 'nexus-api').trim();
+    const companyId = optionalCompanyId(req.body?.companyId);
+    if (!readerCode) return fail(res, 400, 'readerCode is required.');
+    if (!note) return fail(res, 400, 'note is required.');
+    const allowed = new Set(['MAINTENANCE', 'INCIDENT', 'REPLACEMENT', 'GENERAL']);
+    if (!allowed.has(noteType)) return fail(res, 400, 'Invalid noteType.');
+    await query(
+      `INSERT INTO enormity_device_notes (readerCode, companyId, note, noteType, addedBy)
+       VALUES (?, ?, ?, ?, ?)`,
+      [readerCode, companyId, note, noteType, addedBy]
+    );
+    return ok(res, { readerCode, companyId, noteType, addedBy });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/devices/:readerCode/notes', err, 'Failed to store device note.');
+  }
+});
+
+app.get('/api/enormity/devices/:readerCode/notes', async (req, res) => {
+  try {
+    const readerCode = String(req.params.readerCode || '').trim();
+    if (!readerCode) return fail(res, 400, 'readerCode is required.');
+    const rows = await query(
+      `SELECT id, readerCode, companyId, note, noteType, addedBy, createdAt
+         FROM enormity_device_notes
+        WHERE readerCode = ?
+        ORDER BY createdAt DESC, id DESC`,
+      [readerCode]
+    );
+    return ok(res, { readerCode, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/devices/:readerCode/notes', err, 'Failed to fetch device notes.');
   }
 });
 
@@ -923,7 +1482,13 @@ let lastEscalationId = 0;
 function broadcast(event) {
   const payload = JSON.stringify(event);
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(payload);
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(payload);
+      } catch (err) {
+        console.error('[Enormity] WebSocket broadcast failed:', err.message);
+      }
+    }
   }
 }
 
@@ -1032,7 +1597,7 @@ app.use((req, res) => {
   fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
+const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
 });
 
@@ -1041,4 +1606,18 @@ wsServer.listen(WS_PORT, '127.0.0.1', async () => {
   setInterval(pollPatrolScans, 10000);
   setInterval(pollEscalations, 5000);
   console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
+});
+
+process.on('SIGTERM', async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('[Enormity] SIGTERM received - closing server gracefully');
+  wsServer.close(() => console.log('[Enormity] WebSocket server closed cleanly'));
+  server.close(async () => {
+    try { await pool.end(); } catch (err) { console.error('[Enormity] pool close failed:', err.message); }
+    try { if (redisReady) await redis.quit(); } catch (err) { console.error('[Enormity] redis close failed:', err.message); }
+    console.log('[Enormity] Server closed cleanly');
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 5000).unref();
 });

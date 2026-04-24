@@ -4,23 +4,35 @@ const archiver = require('archiver');
 const PAGE = { margin: 36, width: 842, height: 595 };
 const WATERMARK = 'Enormity Tech R&D';
 
+function generationTimestamp(value) {
+  const now = value instanceof Date ? value : new Date();
+  const dd = String(now.getDate()).padStart(2, '0');
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const min = String(now.getMinutes()).padStart(2, '0');
+  return `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+}
+
 function fmt(value) {
   if (value === null || value === undefined) return '';
-  if (value instanceof Date) return value.toISOString().replace('T', ' ').slice(0, 19);
+  if (value instanceof Date) return generationTimestamp(value);
   return String(value);
 }
 
 function drawHeader(doc, title, meta) {
   doc.rect(0, 0, PAGE.width, 74).fill('#f7f9fc');
-  doc.fillColor('#1f2937').font('Helvetica-Bold').fontSize(16).text('KEMENTERIAN PENDIDIKAN MALAYSIA', PAGE.margin, 20);
-  doc.fontSize(9).fillColor('#64748b').text('Sistem Pemantauan Rondaan Keselamatan - Enormity Nexus', PAGE.margin, 42);
+  doc.rect(PAGE.margin, 16, 66, 42).fillAndStroke('#ffffff', '#94a3b8');
+  doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(9).text('LOGO', PAGE.margin + 18, 31);
+  doc.fillColor('#1f2937').font('Helvetica-Bold').fontSize(16).text('KEMENTERIAN PENDIDIKAN MALAYSIA', PAGE.margin + 82, 20);
+  doc.fontSize(9).fillColor('#64748b').text('Sistem Pemantauan Rondaan Keselamatan - Enormity Nexus', PAGE.margin + 82, 42);
   doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(13).text(title, PAGE.margin, 86, { width: PAGE.width - PAGE.margin * 2, align: 'center' });
   doc.font('Helvetica').fontSize(8).fillColor('#334155');
   const left = PAGE.margin;
   const top = 116;
   doc.text(`Nama Syarikat: ${fmt(meta.companyName || '-')}`, left, top);
   doc.text(`Tempoh Laporan: ${fmt(meta.period || meta.date || '-')}`, left, top + 14);
-  doc.text(`Tarikh Jana: ${new Date().toISOString().slice(0, 10)}`, PAGE.width - 220, top);
+  doc.text(`Tarikh Jana: ${fmt(meta.generatedAt || generationTimestamp())}`, PAGE.width - 220, top);
   doc.text(`Rujukan: ENO-KPM-${fmt(meta.reportCode || 'REPORT')}`, PAGE.width - 220, top + 14);
   doc.moveTo(PAGE.margin, top + 34).lineTo(PAGE.width - PAGE.margin, top + 34).strokeColor('#cbd5e1').stroke();
 }
@@ -80,26 +92,37 @@ function drawSignatures(doc, y) {
   doc.text('Penyelia', PAGE.width - PAGE.margin - boxW, top + 50);
 }
 
-function drawFooter(doc) {
-  const page = doc.bufferedPageRange().count;
-  doc.font('Helvetica').fontSize(7).fillColor('#94a3b8')
-    .text(`${WATERMARK} | Dokumen dijana secara automatik | Halaman ${page}`, PAGE.margin, PAGE.height - 32, { width: PAGE.width - PAGE.margin * 2, align: 'center' });
+function drawSummary(doc, summary, y) {
+  if (!summary) return y;
+  const top = Math.min(y + 18, PAGE.height - 150);
+  doc.rect(PAGE.margin, top, PAGE.width - PAGE.margin * 2, 26).fill('#eef4fb');
+  doc.font('Helvetica-Bold').fontSize(8).fillColor('#0f172a')
+    .text(summary, PAGE.margin + 10, top + 9, { width: PAGE.width - PAGE.margin * 2 - 20, align: 'left' });
+  return top + 30;
 }
 
-function renderReport({ title, reportCode, companyName, period, columns, rows }) {
+function drawFooter(doc, pageNumber, totalPages, generatedAt) {
+  const page = doc.bufferedPageRange().count;
+  doc.font('Helvetica').fontSize(7).fillColor('#94a3b8')
+    .text(`${WATERMARK} | Dijana pada: ${generatedAt || generationTimestamp()} | Muka Surat ${pageNumber} dari ${totalPages || page}`, PAGE.margin, PAGE.height - 32, { width: PAGE.width - PAGE.margin * 2, align: 'center' });
+}
+
+function renderReport({ title, reportCode, companyName, period, columns, rows, summary }) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: PAGE.margin, bufferPages: true });
     const chunks = [];
+    const generatedAt = generationTimestamp();
     doc.on('data', (chunk) => chunks.push(chunk));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
-    drawHeader(doc, title, { reportCode, companyName, period });
-    const y = drawTable(doc, columns, rows, 160);
+    drawHeader(doc, title, { reportCode, companyName, period, generatedAt });
+    let y = drawTable(doc, columns, rows, 160);
+    y = drawSummary(doc, summary, y);
     drawSignatures(doc, y);
     const range = doc.bufferedPageRange();
     for (let i = range.start; i < range.start + range.count; i += 1) {
       doc.switchToPage(i);
-      drawFooter(doc);
+      drawFooter(doc, i - range.start + 1, range.count, generatedAt);
     }
     doc.end();
   });
@@ -112,7 +135,8 @@ async function pkk2({ companyName, month, year, rows }) {
     { key: 'approvedGuards', label: 'Bilangan Pengawal Diluluskan', w: 16, align: 'center' },
     { key: 'guardsOnDuty', label: 'Bilangan Pengawal Bertugas', w: 16, align: 'center' },
     { key: 'siteCount', label: 'Bilangan Tapak Kawalan', w: 16, align: 'center' },
-    { key: 'complianceRate', label: 'Peratusan Pematuhan', w: 15, align: 'center' },
+    { key: 'complianceRate', label: 'Peratusan Pematuhan', w: 12, align: 'center' },
+    { key: 'kpmGrade', label: 'Gred KPM', w: 9, align: 'center' },
   ];
   return renderReport({ title: 'PKK 2 - LAPORAN RINGKASAN PENGAWAL KESELAMATAN', reportCode: 'PKK2', companyName, period: `${month}/${year}`, columns, rows });
 }
@@ -120,7 +144,7 @@ async function pkk2({ companyName, month, year, rows }) {
 async function pkk3({ companyName, date, rows }) {
   const columns = [
     { key: 'bil', label: 'Bil', w: 4, align: 'center' },
-    { key: 'guardName', label: 'Nama Pengawal', w: 17 },
+    { key: 'guardName', label: 'Nama Pengawal Keselamatan', w: 19 },
     { key: 'icNo', label: 'No. KP', w: 12 },
     { key: 'date', label: 'Tarikh', w: 10, align: 'center' },
     { key: 'clockIn', label: 'Masa Lapor Diri', w: 13, align: 'center' },
@@ -133,16 +157,71 @@ async function pkk3({ companyName, date, rows }) {
 }
 
 async function pkk4({ companyName, date, rows }) {
+  const completed = rows.filter((row) => String(row.status || '').toUpperCase() === 'SELESAI').length;
+  const missed = Math.max(rows.length - completed, 0);
+  const compliance = rows.length > 0 ? ((completed / rows.length) * 100).toFixed(2) : '0.00';
   const columns = [
     { key: 'bil', label: 'Bil', w: 5, align: 'center' },
-    { key: 'guardName', label: 'Nama Pengawal', w: 20 },
-    { key: 'guardCode', label: 'Kod Pengawal', w: 14 },
-    { key: 'siteName', label: 'Nama Tapak Kawalan', w: 24 },
+    { key: 'guardName', label: 'Nama Pengawal Keselamatan', w: 22 },
+    { key: 'siteName', label: 'Tapak Kawalan', w: 24 },
     { key: 'patrolTime', label: 'Masa Rondaan', w: 18, align: 'center' },
-    { key: 'status', label: 'Status', w: 10, align: 'center' },
-    { key: 'remarks', label: 'Catatan', w: 20 },
+    { key: 'status', label: 'Status Rondaan', w: 12, align: 'center' },
+    { key: 'deviceCode', label: 'Kod Peranti', w: 15, align: 'center' },
+    { key: 'remarks', label: 'Catatan', w: 18 },
   ];
-  return renderReport({ title: 'PKK 4 - REKOD RONDAAN PENGAWAL KESELAMATAN', reportCode: 'PKK4', companyName, period: date, columns, rows });
+  const summary = `Total Pusat Kawalan: ${rows.length} | Selesai: ${completed} | Terlepas: ${missed} | Pematuhan: ${compliance}%`;
+  return renderReport({ title: 'PKK 4 - REKOD RONDAAN PENGAWAL KESELAMATAN', reportCode: 'PKK4', companyName, period: date, columns, rows, summary });
+}
+
+async function dailyScorecard({ companyName, date, scorecard = {}, topGuards = [], unresolvedSos = [] }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+    const chunks = [];
+    const generatedAt = generationTimestamp();
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.rect(0, 0, 595, 110).fill('#0f172a');
+    doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(18).text('ENORMITY DAILY SCORECARD', 36, 28);
+    doc.fontSize(10).fillColor('#cbd5e1').text(`Nama Syarikat: ${companyName || '-'}`, 36, 58);
+    doc.text(`Tarikh: ${date || '-'}`, 36, 74);
+    doc.text(`Gred KPM: ${scorecard.kpmGrade || '-'}`, 400, 58);
+    doc.text(`Dijana pada: ${generatedAt}`, 400, 74);
+
+    const cards = [
+      { label: 'Jumlah Imbasan', value: scorecard.totalScans || 0 },
+      { label: 'Pengawal Aktif', value: scorecard.activeGuards || 0 },
+      { label: 'Tapak Aktif', value: scorecard.activeSites || 0 },
+      { label: 'Alarm SOS', value: scorecard.sosAlarms || 0 },
+      { label: 'Kadar Pematuhan', value: `${scorecard.complianceRate || 0}%` },
+      { label: 'Gred', value: scorecard.kpmGrade || '-' },
+    ];
+    cards.forEach((card, index) => {
+      const x = 36 + ((index % 3) * 174);
+      const y = 136 + (Math.floor(index / 3) * 88);
+      doc.roundedRect(x, y, 160, 68, 12).fillAndStroke('#f8fafc', '#cbd5e1');
+      doc.fillColor('#64748b').font('Helvetica').fontSize(9).text(card.label, x + 12, y + 14);
+      doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(18).text(String(card.value), x + 12, y + 32);
+    });
+
+    doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(12).text('Top 3 Pengawal Hari Ini', 36, 330);
+    topGuards.forEach((row, index) => {
+      doc.font('Helvetica').fontSize(10).text(`${index + 1}. ${fmt(row.guardName)} - ${fmt(row.totalScans)} imbasan`, 48, 352 + (index * 18));
+    });
+
+    doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(12).text('SOS Belum Selesai', 320, 330);
+    if (!unresolvedSos.length) {
+      doc.font('Helvetica').fontSize(10).text('Tiada alarm SOS belum selesai.', 332, 352);
+    } else {
+      unresolvedSos.slice(0, 5).forEach((row, index) => {
+        doc.font('Helvetica').fontSize(10).text(`${index + 1}. ${fmt(row.guardName)} | ${fmt(row.siteName)} | ${fmt(row.happenTime)}`, 332, 352 + (index * 18), { width: 220 });
+      });
+    }
+
+    drawFooter(doc, 1, 1, generatedAt);
+    doc.end();
+  });
 }
 
 function bundle(res, files) {
@@ -156,4 +235,4 @@ function bundle(res, files) {
   });
 }
 
-module.exports = { pkk2, pkk3, pkk4, bundle };
+module.exports = { pkk2, pkk3, pkk4, dailyScorecard, bundle };
