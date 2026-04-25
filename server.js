@@ -964,16 +964,15 @@ app.get('/api/enormity/audit/logs', async (req, res) => {
     const days = parsePositiveInt(req.query.days, 7, 90);
     const limit = parsePositiveInt(req.query.limit, 100, 500);
     const eventType = String(req.query.eventType || '').trim();
-    const params = [days];
+    const params = [];
     let sql = `SELECT id, event_type, endpoint, user_name, ip_address, success, response_code, response_time_ms, reason, created_at
                  FROM enormity_audit_log
-                WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL ${days} DAY)`;
     if (eventType) {
       sql += ' AND event_type = ?';
       params.push(eventType);
     }
-    sql += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(limit);
+    sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
     const rows = await query(sql, params);
     return ok(res, rows.map((row) => ({
       id: row.id,
