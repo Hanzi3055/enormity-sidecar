@@ -20,7 +20,21 @@ function fmt(value) {
   return String(value);
 }
 
-function drawHeader(doc, title, meta) {
+function safeRows(rows) {
+  return Array.isArray(rows) ? rows.filter(Boolean) : [];
+}
+
+function withPdfError(label, producer) {
+  return Promise.resolve()
+    .then(producer)
+    .catch((err) => {
+      const wrapped = new Error(`${label} PDF generation failed: ${err.message}`);
+      wrapped.cause = err;
+      throw wrapped;
+    });
+}
+
+function drawHeader(doc, title, meta = {}) {
   doc.rect(0, 0, PAGE.width, 74).fill('#f7f9fc');
   doc.rect(PAGE.margin, 16, 66, 42).fillAndStroke('#ffffff', '#94a3b8');
   doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(9).text('LOGO', PAGE.margin + 18, 31);
@@ -43,6 +57,9 @@ function fitText(doc, text, x, y, width, height, options = {}) {
 }
 
 function drawTable(doc, columns, rows, yStart) {
+  columns = safeRows(columns);
+  rows = safeRows(rows);
+  if (!columns.length) columns = [{ key: 'message', label: 'Maklumat', w: 1 }];
   const tableWidth = PAGE.width - PAGE.margin * 2;
   const totalWeight = columns.reduce((sum, c) => sum + c.w, 0);
   const widths = columns.map((c) => Math.floor((c.w / totalWeight) * tableWidth));
@@ -115,8 +132,9 @@ function renderReport({ title, reportCode, companyName, period, columns, rows, s
     doc.on('data', (chunk) => chunks.push(chunk));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
-    drawHeader(doc, title, { reportCode, companyName, period, generatedAt });
-    let y = drawTable(doc, columns, rows, 160);
+    const safeReportRows = safeRows(rows);
+    drawHeader(doc, title || 'Laporan KPM', { reportCode, companyName: companyName || '-', period: period || '-', generatedAt });
+    let y = drawTable(doc, columns, safeReportRows.length ? safeReportRows : [{ message: 'Tiada rekod untuk tempoh laporan.' }], 160);
     y = drawSummary(doc, summary, y);
     drawSignatures(doc, y);
     const range = doc.bufferedPageRange();
@@ -128,7 +146,8 @@ function renderReport({ title, reportCode, companyName, period, columns, rows, s
   });
 }
 
-async function pkk2({ companyName, month, year, rows }) {
+async function pkk2({ companyName = '-', month = '-', year = '-', rows = [] } = {}) {
+  return withPdfError('PKK2', () => {
   const columns = [
     { key: 'bil', label: 'Bil', w: 5, align: 'center' },
     { key: 'companyName', label: 'Nama Syarikat Keselamatan', w: 26 },
@@ -139,9 +158,11 @@ async function pkk2({ companyName, month, year, rows }) {
     { key: 'kpmGrade', label: 'Gred KPM', w: 9, align: 'center' },
   ];
   return renderReport({ title: 'PKK 2 - LAPORAN RINGKASAN PENGAWAL KESELAMATAN', reportCode: 'PKK2', companyName, period: `${month}/${year}`, columns, rows });
+  });
 }
 
-async function pkk3({ companyName, date, rows }) {
+async function pkk3({ companyName = '-', date = '-', rows = [] } = {}) {
+  return withPdfError('PKK3', () => {
   const columns = [
     { key: 'bil', label: 'Bil', w: 4, align: 'center' },
     { key: 'guardName', label: 'Nama Pengawal Keselamatan', w: 19 },
@@ -154,9 +175,12 @@ async function pkk3({ companyName, date, rows }) {
     { key: 'remarks', label: 'Catatan', w: 14 },
   ];
   return renderReport({ title: 'PKK 3 - REKOD KEHADIRAN PENGAWAL KESELAMATAN', reportCode: 'PKK3', companyName, period: date, columns, rows });
+  });
 }
 
-async function pkk4({ companyName, date, rows }) {
+async function pkk4({ companyName = '-', date = '-', rows = [] } = {}) {
+  return withPdfError('PKK4', () => {
+  rows = safeRows(rows);
   const completed = rows.filter((row) => String(row.status || '').toUpperCase() === 'SELESAI').length;
   const missed = Math.max(rows.length - completed, 0);
   const compliance = rows.length > 0 ? ((completed / rows.length) * 100).toFixed(2) : '0.00';
@@ -171,10 +195,14 @@ async function pkk4({ companyName, date, rows }) {
   ];
   const summary = `Total Pusat Kawalan: ${rows.length} | Selesai: ${completed} | Terlepas: ${missed} | Pematuhan: ${compliance}%`;
   return renderReport({ title: 'PKK 4 - REKOD RONDAAN PENGAWAL KESELAMATAN', reportCode: 'PKK4', companyName, period: date, columns, rows, summary });
+  });
 }
 
 async function dailyScorecard({ companyName, date, scorecard = {}, topGuards = [], unresolvedSos = [] }) {
-  return new Promise((resolve, reject) => {
+  return withPdfError('Daily scorecard', () => new Promise((resolve, reject) => {
+    topGuards = safeRows(topGuards);
+    unresolvedSos = safeRows(unresolvedSos);
+    scorecard = scorecard || {};
     const doc = new PDFDocument({ size: 'A4', margin: 36 });
     const chunks = [];
     const generatedAt = generationTimestamp();
@@ -221,7 +249,7 @@ async function dailyScorecard({ companyName, date, scorecard = {}, topGuards = [
 
     drawFooter(doc, 1, 1, generatedAt);
     doc.end();
-  });
+  }));
 }
 
 function bundle(res, files) {
@@ -230,7 +258,11 @@ function bundle(res, files) {
     archive.on('error', reject);
     archive.on('end', resolve);
     archive.pipe(res);
-    files.forEach((file) => archive.append(file.buffer, { name: file.name }));
+    safeRows(files).forEach((file, index) => {
+      const name = file.name || `report-${index + 1}.pdf`;
+      const buffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(String(file.buffer || ''));
+      archive.append(buffer, { name });
+    });
     archive.finalize();
   });
 }

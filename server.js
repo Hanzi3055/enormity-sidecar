@@ -41,18 +41,55 @@ if (VALID_API_KEYS.length === 0) {
   throw new Error('ENORMITY_API_KEYS must contain at least one API key.');
 }
 
+const QUERY_TIMEOUT_MS = Number(process.env.MYSQL_QUERY_TIMEOUT_MS || 10000);
+const POOL_CONFIG = {
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  connectTimeout: 10000,
+};
+const poolStats = { acquired: 0, released: 0, created: 0, destroyed: 0, enqueued: 0, timedOut: 0 };
+const RETRYABLE_DB_ERRORS = new Set([
+  'ECONNRESET',
+  'PROTOCOL_CONNECTION_LOST',
+]);
+
 const pool = mysql.createPool({
   host: process.env.MYSQL_HOST || '127.0.0.1',
   port: Number(process.env.MYSQL_PORT || 13306),
   user: process.env.MYSQL_USER || 'root',
   password: process.env.MYSQL_PASSWORD || '',
   database: process.env.MYSQL_DATABASE || 'cloudpatrol',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  connectTimeout: 10000,
+  waitForConnections: POOL_CONFIG.waitForConnections,
+  connectionLimit: POOL_CONFIG.connectionLimit,
+  queueLimit: POOL_CONFIG.queueLimit,
+  connectTimeout: POOL_CONFIG.connectTimeout,
   timezone: 'local',
   dateStrings: false,
+});
+
+pool.on('connection', (connection) => {
+  poolStats.created += 1;
+  console.log(`[Enormity] MySQL pool connection created threadId=${connection.threadId}`);
+  connection.on('end', () => {
+    poolStats.destroyed += 1;
+    console.log(`[Enormity] MySQL pool connection ended threadId=${connection.threadId}`);
+  });
+  connection.on('error', (err) => {
+    console.error(`[Enormity] MySQL pool connection error threadId=${connection.threadId}:`, err.message);
+  });
+});
+pool.on('acquire', (connection) => {
+  poolStats.acquired += 1;
+  console.log(`[Enormity] MySQL pool acquire threadId=${connection.threadId}`);
+});
+pool.on('release', (connection) => {
+  poolStats.released += 1;
+  console.log(`[Enormity] MySQL pool release threadId=${connection.threadId}`);
+});
+pool.on('enqueue', () => {
+  poolStats.enqueued += 1;
+  console.warn('[Enormity] MySQL pool enqueue waiting for free connection');
 });
 
 const redis = new Redis({
@@ -69,6 +106,9 @@ const PATROL_STATS_TTL_MS = 30 * 1000;
 const REPORT_ARCHIVE_ROOT = process.env.KPM_ARCHIVE_ROOT || '/opt/enormity-sidecar/reports/archive';
 const notifiedEscalations = new Set();
 let shuttingDown = false;
+let acceptingRequests = true;
+let inFlightRequests = 0;
+const intervalHandles = [];
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -105,6 +145,12 @@ const protectedLimiter = rateLimit({
 });
 
 app.use((req, res, next) => {
+  if (!acceptingRequests) {
+    return fail(res, 503, 'Service is shutting down. Try again shortly.', null, 'E_SHUTDOWN');
+  }
+  inFlightRequests += 1;
+  res.on('finish', () => { inFlightRequests = Math.max(0, inFlightRequests - 1); });
+  res.on('close', () => { if (!res.writableEnded) inFlightRequests = Math.max(0, inFlightRequests - 1); });
   const start = process.hrtime.bigint();
   const requestId = req.headers['x-request-id'] || crypto.randomUUID();
   req.requestId = requestId;
@@ -151,6 +197,9 @@ function fail(res, status, message, details, code) {
 
 function handleRouteError(res, route, err, fallbackMessage) {
   console.error(`[Enormity] ${route} error:`, err && err.message, err && err.stack ? err.stack : '');
+  if (err && err.code === 'QUERY_TIMEOUT') {
+    return fail(res, 503, 'Database query timed out. Try again shortly.', fallbackMessage || err.message, 'QUERY_TIMEOUT');
+  }
   if (err && err.status && err.status < 500) {
     return fail(res, err.status, fallbackMessage || err.message, err.message, err.code || 'E400');
   }
@@ -239,9 +288,68 @@ function companyWhere(companyId, alias) {
   return { clause: ` AND ${column} = ?`, params: [companyId] };
 }
 
+function poolHealthSnapshot() {
+  const rawPool = pool.pool || {};
+  const all = rawPool._allConnections?.length || 0;
+  const idle = rawPool._freeConnections?.length || 0;
+  const waiting = rawPool._connectionQueue?.length || 0;
+  return {
+    config: POOL_CONFIG,
+    activeConnections: Math.max(0, all - idle),
+    idleConnections: idle,
+    totalConnections: all,
+    waitingRequests: waiting,
+    counters: { ...poolStats },
+  };
+}
+
+function isRetryableDbError(err) {
+  return RETRYABLE_DB_ERRORS.has(err && err.code);
+}
+
+async function executeQueryOnce(sql, params = []) {
+  let connection;
+  let timedOut = false;
+  const started = Date.now();
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    poolStats.timedOut += 1;
+    console.error(`[Enormity] MySQL query timed out after ${QUERY_TIMEOUT_MS}ms: ${String(sql).slice(0, 220)}`);
+    if (connection && typeof connection.destroy === 'function') {
+      connection.destroy();
+    }
+  }, QUERY_TIMEOUT_MS);
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute({ sql, timeout: QUERY_TIMEOUT_MS }, params);
+    return rows;
+  } catch (err) {
+    if (timedOut || /timeout/i.test(err.message || '')) {
+      err.code = 'QUERY_TIMEOUT';
+      err.status = 503;
+      err.message = `Database query exceeded ${QUERY_TIMEOUT_MS}ms timeout`;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    if (connection && !timedOut) {
+      try { connection.release(); } catch (_) {}
+    }
+    const duration = Date.now() - started;
+    if (duration > 1000) {
+      console.warn(`[Enormity] Slow MySQL query ${duration}ms: ${String(sql).slice(0, 220)}`);
+    }
+  }
+}
+
 async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params);
-  return rows;
+  try {
+    return await executeQueryOnce(sql, params);
+  } catch (err) {
+    if (!isRetryableDbError(err)) throw err;
+    console.warn(`[Enormity] MySQL transient connection error ${err.code}; retrying once.`);
+    return executeQueryOnce(sql, params);
+  }
 }
 
 function firstResultSet(rows) {
@@ -415,6 +523,21 @@ async function auditRequest(req, res, durationMs) {
   }
 }
 
+let lastAuditCleanupDate = '';
+async function cleanupAuditLogs(force = false) {
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const due = force || (now.getHours() === 3 && now.getMinutes() === 0);
+  if (!due || (!force && lastAuditCleanupDate === today)) return;
+  lastAuditCleanupDate = today;
+  try {
+    const result = await query('DELETE FROM enormity_audit_log WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)');
+    console.log(`[Enormity] audit cleanup completed olderThan=90d affectedRows=${result.affectedRows || 0}`);
+  } catch (err) {
+    console.error('[Enormity] audit cleanup failed:', err.message);
+  }
+}
+
 function sanitizeAuditBody(body) {
   const clean = { ...body };
   if (clean.apiKey) clean.apiKey = '[redacted]';
@@ -473,6 +596,7 @@ app.get('/api/enormity/health', publicLimiter, async (req, res) => {
       database: {
         connected: databaseHealth.connected,
         latencyMs: databaseHealth.latencyMs,
+        pool: poolHealthSnapshot(),
       },
       redis: {
         connected: redisHealth.connected,
@@ -526,6 +650,7 @@ app.get('/api/enormity/health/db', authenticateJwt, protectedLimiter, async (req
         port: Number(process.env.MYSQL_PORT || 13306),
         database: process.env.MYSQL_DATABASE || 'cloudpatrol',
         latencyMs: databaseHealth.latencyMs,
+        pool: poolHealthSnapshot(),
       },
       redis: redisHealth,
       patrolStats,
@@ -609,8 +734,7 @@ app.post('/api/enormity/auth/refresh', authLimiter, authenticateJwt, (req, res) 
 app.get('/api/enormity/docs.json', publicLimiter, (req, res) => {
   const specPath = path.join(__dirname, 'openapi.yaml');
   if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
-  res.type('application/json');
-  return res.send(JSON.stringify(fs.readFileSync(specPath, 'utf8')));
+  return ok(res, { format: 'yaml', content: fs.readFileSync(specPath, 'utf8') });
 });
 
 app.get('/api/enormity/docs', publicLimiter, (req, res) => {
@@ -2053,8 +2177,27 @@ function broadcast(event) {
 }
 
 wss.on('connection', (socket) => {
+  socket.isAlive = true;
+  socket.on('pong', () => {
+    socket.isAlive = true;
+  });
   socket.send(JSON.stringify({ event: 'CONNECTED', service: 'enormity-realtime', timestamp: timestamp() }));
 });
+
+function heartbeatWebSocketClients() {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    client.isAlive = false;
+    try {
+      client.ping();
+    } catch (err) {
+      client.terminate();
+    }
+  }
+}
 
 async function initialiseRealtimeCursors() {
   try {
@@ -2068,8 +2211,9 @@ async function initialiseRealtimeCursors() {
 }
 
 async function pollPatrolScans() {
+  let rows = [];
   try {
-    const rows = await query(
+    rows = await query(
       `SELECT ID AS id,
               GUARDNAME AS guardName,
               SITENAME AS siteName,
@@ -2095,6 +2239,8 @@ async function pollPatrolScans() {
     }
   } catch (err) {
     console.error('patrol scan poll failed:', err.message);
+  } finally {
+    rows = null;
   }
 }
 
@@ -2115,8 +2261,9 @@ async function sendTelegramAlert(escalation) {
 }
 
 async function pollCriticalSosAlarms() {
+  let rows = [];
   try {
-    const rows = await query(
+    rows = await query(
       `SELECT a.ID AS alarmId,
               a.COMPANYID AS companyId,
               a.ALARMTYPE AS alarmType,
@@ -2153,12 +2300,15 @@ async function pollCriticalSosAlarms() {
     }
   } catch (err) {
     console.error('critical sos poll failed:', err.message);
+  } finally {
+    rows = null;
   }
 }
 
 async function pollEscalations() {
+  let rows = [];
   try {
-    const rows = await query(
+    rows = await query(
       `SELECT escalation_id AS escalationId,
               alarm_id AS alarmId,
               companyid AS companyId,
@@ -2192,6 +2342,8 @@ async function pollEscalations() {
     }
   } catch (err) {
     console.error('alarm poll failed:', err.message);
+  } finally {
+    rows = null;
   }
 }
 
@@ -2215,6 +2367,23 @@ async function validateStartup() {
 }
 
 let server;
+function trackInterval(handle) {
+  intervalHandles.push(handle);
+  return handle;
+}
+
+function waitForInflight(maxMs) {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (inFlightRequests <= 0 || Date.now() - started >= maxMs) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 250);
+  });
+}
+
 validateStartup().then(() => {
   server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
@@ -2222,10 +2391,12 @@ validateStartup().then(() => {
 
   wsServer.listen(WS_PORT, '127.0.0.1', async () => {
     await initialiseRealtimeCursors();
-    setInterval(pollPatrolScans, 10000);
-    setInterval(pollCriticalSosAlarms, 5000);
-    setInterval(pollEscalations, 5000);
-    setInterval(() => runMonthlyArchiveScheduler(false).catch((err) => console.error('[Enormity] archive scheduler failed:', err.message)), 60000);
+    trackInterval(setInterval(pollPatrolScans, 10000));
+    trackInterval(setInterval(pollCriticalSosAlarms, 5000));
+    trackInterval(setInterval(pollEscalations, 5000));
+    trackInterval(setInterval(heartbeatWebSocketClients, 30000));
+    trackInterval(setInterval(cleanupAuditLogs, 60000));
+    trackInterval(setInterval(() => runMonthlyArchiveScheduler(false).catch((err) => console.error('[Enormity] archive scheduler failed:', err.message)), 60000));
     console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
   });
 }).catch((err) => {
@@ -2236,14 +2407,26 @@ validateStartup().then(() => {
 process.on('SIGTERM', async () => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('[Enormity] SIGTERM received - closing server gracefully');
-  wsServer.close(() => console.log('[Enormity] WebSocket server closed cleanly'));
-  if (!server) process.exit(0);
-  server.close(async () => {
-    try { await pool.end(); } catch (err) { console.error('[Enormity] pool close failed:', err.message); }
-    try { if (redisReady) await redis.quit(); } catch (err) { console.error('[Enormity] redis close failed:', err.message); }
-    console.log('[Enormity] Server closed cleanly');
-    process.exit(0);
+  acceptingRequests = false;
+  console.log(`[Enormity] SIGTERM received - graceful shutdown started inFlight=${inFlightRequests}`);
+  intervalHandles.forEach((handle) => clearInterval(handle));
+  await new Promise((resolve) => {
+    if (!server) return resolve();
+    server.close(resolve);
   });
-  setTimeout(() => process.exit(0), 5000).unref();
+  await new Promise((resolve) => {
+    try { wsServer.close(resolve); } catch (_) { resolve(); }
+  });
+  await waitForInflight(30000);
+  try { await pool.end(); console.log('[Enormity] MySQL pool closed cleanly'); } catch (err) { console.error('[Enormity] pool close failed:', err.message); }
+  try {
+    if (redisReady) {
+      await redis.quit();
+      console.log('[Enormity] Redis connection closed cleanly');
+    }
+  } catch (err) {
+    console.error('[Enormity] redis close failed:', err.message);
+  }
+  console.log('[Enormity] Server closed cleanly');
+  process.exit(0);
 });
