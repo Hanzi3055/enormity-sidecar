@@ -34,3 +34,39 @@ JWT-authenticated REST API serving analytics, KPM compliance reports, and real-t
 
 ## Malaysian KPM Compliance
 This API generates PKK 2, PKK 3, and PKK 4 reports formatted for the Malaysian Ministry of Education (Kementerian Pendidikan Malaysia) school security compliance requirements.
+
+## MRANTI / MySTI Evidence - Application #845123
+
+### What this repository contains
+This repository contains the Enormity-owned Node.js sidecar API for the live Enormity Nexus / CloudPatrol deployment. It provides the professional API layer, JWT authentication, KPM report generation endpoints, Redis-backed caching, WebSocket integration, health/status endpoints, and MySQL analytics access over the OEM CloudPatrol database.
+
+### How it relates to MySTI #845123
+The sidecar is the in-house innovation layer that turns OEM patrol records into KPM-ready management APIs, live operations dashboards, device health reporting, guard analytics, audit logging, and MRANTI-verifiable demo/status surfaces.
+
+### Key files
+- `server.js` - Express API, JWT auth, rate limits, health/status, analytics, reports, WebSocket support, and audit logging.
+- `kpm-engine.js` - PKK 2, PKK 3, PKK 4, bundle, and daily scorecard PDF generation logic.
+- `openapi.yaml` - Machine-readable API documentation source.
+- `ecosystem.config.js` - PM2 production process definition for sidecar and healer.
+- `.env.example` - Safe configuration template with no production secrets.
+
+### Live verification URLs
+- `https://nexus.enormity.tech/api/enormity/health`
+- `https://nexus.enormity.tech/api/enormity/docs`
+- `https://nexus.enormity.tech/api/enormity/docs.json`
+- `https://enormity.tech/demo`
+- `https://portal.enormity.tech/api/enormity/health`
+
+### Line count summary
+- `server.js`: 1,729 lines
+- `kpm-engine.js`: 238 lines
+- `ecosystem.config.js`: 39 lines
+- Integrated OEM UI module: 3,598 lines at `/opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/static/enormity-integrated.js`
+
+### Current hardening evidence
+- Public health route is sanitized.
+- Infrastructure diagnostics are JWT-protected.
+- Public, auth, and protected route rate limits are split.
+- Redis cache stats use `INFO memory` and `INFO stats`, not blocking key scans.
+- Startup validation checks required configuration, database connectivity, and Redis connectivity before accepting traffic.
+

@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -49,6 +49,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
+  connectTimeout: 10000,
   timezone: 'local',
   dateStrings: false,
 });
@@ -62,14 +63,44 @@ const redis = new Redis({
 });
 let redisReady = false;
 const cacheCounters = { hits: 0, misses: 0 };
+const patrolStatsCache = { key: null, data: null, timestamp: 0 };
+const PATROL_STATS_TTL_MS = 30 * 1000;
 const notifiedEscalations = new Set();
 let shuttingDown = false;
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
+
+function rateLimitKey(req) {
+  return ipKeyGenerator(clientIp(req));
+}
+
+const publicLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: rateLimitKey,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: rateLimitKey,
+});
+
+const protectedLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.enormityAuth?.subject || rateLimitKey(req),
+});
 
 app.use((req, res, next) => {
   const start = process.hrtime.bigint();
@@ -264,6 +295,12 @@ async function checkDatabase() {
   return rows[0] && rows[0].ok === 1;
 }
 
+async function getDatabaseHealth() {
+  const start = Date.now();
+  const connected = await checkDatabase();
+  return { connected, latencyMs: Date.now() - start };
+}
+
 async function getRedisHealth() {
   const start = Date.now();
   const connected = await ensureRedis();
@@ -294,6 +331,18 @@ async function getPatrolStats(date) {
     todayRecords: Number(rows[0]?.todayRecords || 0),
     activeGuards: Number(rows[0]?.activeGuards || 0),
   };
+}
+
+async function getCachedPatrolStats(date) {
+  const now = Date.now();
+  if (patrolStatsCache.key === date && patrolStatsCache.data && now - patrolStatsCache.timestamp < PATROL_STATS_TTL_MS) {
+    return { ...patrolStatsCache.data, cached: true, cacheAgeSeconds: Math.round((now - patrolStatsCache.timestamp) / 1000) };
+  }
+  const data = await getPatrolStats(date);
+  patrolStatsCache.key = date;
+  patrolStatsCache.data = data;
+  patrolStatsCache.timestamp = now;
+  return { ...data, cached: false, cacheAgeSeconds: 0 };
 }
 
 let auditReady = false;
@@ -381,6 +430,10 @@ function authenticateJwt(req, res, next) {
   }
 }
 
+function signAccessToken(subject = 'enormity-sidecar-client', scope = 'api:enormity') {
+  return jwt.sign({ subject, scope }, JWT_SECRET, { expiresIn: '24h' });
+}
+
 function requireApiKey(req, res) {
   const rawApiKey = String(req.body?.apiKey || '').trim();
   const providedKeys = rawApiKey.split(',').map((item) => item.trim()).filter(Boolean);
@@ -388,19 +441,16 @@ function requireApiKey(req, res) {
   if (!matchedKey) {
     return fail(res, 401, 'Invalid API key.');
   }
-  const token = jwt.sign({ subject: 'enormity-sidecar-client', scope: 'api:enormity' }, JWT_SECRET, { expiresIn: '24h' });
+  const token = signAccessToken();
   return ok(res, { token, tokenType: 'Bearer', expiresInSeconds: 86400 });
 }
 
 
-app.get('/api/enormity/health', async (req, res) => {
-  const dbStart = Date.now();
+app.get('/api/enormity/health', publicLimiter, async (req, res) => {
   try {
-    const date = todayString();
-    const [databaseConnected, redisHealth, patrolStats] = await Promise.all([
-      checkDatabase(),
+    const [databaseHealth, redisHealth] = await Promise.all([
+      getDatabaseHealth(),
       getRedisHealth(),
-      getPatrolStats(date),
     ]);
     const memoryUsage = process.memoryUsage();
     const uptimeSeconds = Math.floor(process.uptime());
@@ -416,14 +466,13 @@ app.get('/api/enormity/health', async (req, res) => {
         heapTotal: memoryMb(memoryUsage.heapTotal),
       },
       database: {
-        connected: databaseConnected,
-        host: process.env.MYSQL_HOST || '127.0.0.1',
-        port: Number(process.env.MYSQL_PORT || 13306),
-        database: process.env.MYSQL_DATABASE || 'cloudpatrol',
-        latencyMs: Date.now() - dbStart,
+        connected: databaseHealth.connected,
+        latencyMs: databaseHealth.latencyMs,
       },
-      redis: redisHealth,
-      patrolStats,
+      redis: {
+        connected: redisHealth.connected,
+        latencyMs: redisHealth.latencyMs,
+      },
       node: process.version,
       timestamp: timestamp(),
     });
@@ -432,7 +481,7 @@ app.get('/api/enormity/health', async (req, res) => {
   }
 });
 
-app.get('/api/enormity/health/db', async (req, res) => {
+app.get('/api/enormity/health/db', authenticateJwt, protectedLimiter, async (req, res) => {
   try {
     const [[sizeRow], [statusRow], tables, enormityTables, procedures, triggers, views, [activityRow]] = await Promise.all([
       query(`SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS dbSizeMb FROM information_schema.TABLES WHERE table_schema = DATABASE()`),
@@ -459,7 +508,22 @@ app.get('/api/enormity/health/db', async (req, res) => {
     const enormityCounts = {};
     enormityTables.forEach((row) => { enormityCounts[row.tableName] = Number(row.rowCount || 0); });
 
+    const [databaseHealth, redisHealth, patrolStats] = await Promise.all([
+      getDatabaseHealth(),
+      getRedisHealth(),
+      getCachedPatrolStats(todayString()),
+    ]);
+
     return ok(res, {
+      database: {
+        connected: databaseHealth.connected,
+        host: process.env.MYSQL_HOST || '127.0.0.1',
+        port: Number(process.env.MYSQL_PORT || 13306),
+        database: process.env.MYSQL_DATABASE || 'cloudpatrol',
+        latencyMs: databaseHealth.latencyMs,
+      },
+      redis: redisHealth,
+      patrolStats,
       tables: tableCounts,
       enormityTables: enormityCounts,
       procedures: procedures.map((row) => row.Name),
@@ -478,7 +542,7 @@ app.get('/api/enormity/health/db', async (req, res) => {
   }
 });
 
-app.get('/api/enormity/status/overview', async (req, res) => {
+app.get('/api/enormity/status/overview', publicLimiter, async (req, res) => {
   const date = todayString();
   const [start, end] = dateRange(date);
   try {
@@ -517,7 +581,7 @@ app.get('/api/enormity/status/overview', async (req, res) => {
   }
 });
 
-app.get('/api/enormity/status/containers', (req, res) => {
+app.get('/api/enormity/status/containers', authenticateJwt, protectedLimiter, (req, res) => {
   try {
     const output = execSync("docker ps --format '{{.Names}}|{{.Status}}|{{.Ports}}'", { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const rows = output.trim().split('\n').filter(Boolean).map((line) => {
@@ -530,15 +594,28 @@ app.get('/api/enormity/status/containers', (req, res) => {
   }
 });
 
-app.post('/api/enormity/auth/token', requireApiKey);
-app.get('/api/enormity/docs', (req, res) => {
+app.post('/api/enormity/auth/token', authLimiter, requireApiKey);
+app.post('/api/enormity/auth/refresh', authLimiter, authenticateJwt, (req, res) => {
+  const current = req.enormityAuth || {};
+  const token = signAccessToken(current.subject || 'enormity-sidecar-client', current.scope || 'api:enormity');
+  return ok(res, { token, tokenType: 'Bearer', expiresInSeconds: 86400 });
+});
+
+app.get('/api/enormity/docs.json', publicLimiter, (req, res) => {
+  const specPath = path.join(__dirname, 'openapi.yaml');
+  if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
+  res.type('application/json');
+  return res.send(JSON.stringify(fs.readFileSync(specPath, 'utf8')));
+});
+
+app.get('/api/enormity/docs', publicLimiter, (req, res) => {
   const specPath = path.join(__dirname, 'openapi.yaml');
   if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
   res.type('text/yaml');
   return res.send(fs.readFileSync(specPath, 'utf8'));
 });
 
-app.get('/api/enormity/company/list', async (req, res) => {
+app.get('/api/enormity/company/list', publicLimiter, async (req, res) => {
   try {
     const rows = await query(
       `SELECT COMPANYID AS id,
@@ -554,7 +631,7 @@ app.get('/api/enormity/company/list', async (req, res) => {
   }
 });
 
-app.use('/api/enormity', authenticateJwt);
+app.use('/api/enormity', authenticateJwt, protectedLimiter);
 
 app.get('/api/enormity/audit/logs', async (req, res) => {
   try {
@@ -1103,22 +1180,29 @@ app.get('/api/enormity/operations/live', async (req, res) => {
 app.get('/api/enormity/cache/stats', async (req, res) => {
   try {
     const connected = await ensureRedis();
-    if (!connected) return ok(res, { connected: false, hitRate: 0, totalKeys: 0, memoryUsed: null, topKeys: [] });
+    if (!connected) return ok(res, { connected: false, hitRate: 0, memoryUsed: null, totalCommands: 0 });
     const total = cacheCounters.hits + cacheCounters.misses;
-    const [dbSize, info, keys] = await Promise.all([
-      redis.dbsize(),
+    const [memoryInfo, statsInfo] = await Promise.all([
       redis.info('memory'),
-      redis.keys('*').then((items) => items.slice(0, 25)),
+      redis.info('stats'),
     ]);
-    const memoryLine = String(info).split('\n').find((line) => line.startsWith('used_memory_human:')) || '';
+    const parseInfo = (text) => String(text).split('\n').reduce((acc, line) => {
+      const idx = line.indexOf(':');
+      if (idx > 0) acc[line.slice(0, idx)] = line.slice(idx + 1).trim();
+      return acc;
+    }, {});
+    const memory = parseInfo(memoryInfo);
+    const stats = parseInfo(statsInfo);
     return ok(res, {
       connected: true,
       hits: cacheCounters.hits,
       misses: cacheCounters.misses,
       hitRate: total ? Number(((cacheCounters.hits / total) * 100).toFixed(2)) : 0,
-      totalKeys: dbSize,
-      memoryUsed: memoryLine.split(':')[1]?.trim() || null,
-      topKeys: keys,
+      memoryUsed: memory.used_memory_human || null,
+      memoryPeak: memory.used_memory_peak_human || null,
+      totalCommands: Number(stats.total_commands_processed || 0),
+      keyspaceHits: Number(stats.keyspace_hits || 0),
+      keyspaceMisses: Number(stats.keyspace_misses || 0),
     });
   } catch (err) {
     return handleRouteError(res, '/api/enormity/cache/stats', err, 'Failed to read Redis cache stats.');
@@ -1597,15 +1681,36 @@ app.use((req, res) => {
   fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`);
 });
 
-const server = app.listen(PORT, '127.0.0.1', () => {
-  console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
-});
+async function validateStartup() {
+  const missing = [];
+  if (!JWT_SECRET) missing.push('JWT_SECRET');
+  if (VALID_API_KEYS.length === 0) missing.push('ENORMITY_API_KEYS');
+  if (!process.env.MYSQL_HOST) missing.push('MYSQL_HOST');
+  if (!process.env.MYSQL_USER) missing.push('MYSQL_USER');
+  if (!process.env.MYSQL_DATABASE) missing.push('MYSQL_DATABASE');
+  if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  const databaseHealth = await getDatabaseHealth();
+  if (!databaseHealth.connected) throw new Error('Database startup check failed.');
+  const redisHealth = await getRedisHealth();
+  if (!redisHealth.connected) throw new Error('Redis startup check failed.');
+  console.log(`[Enormity] Startup checks passed: db=${databaseHealth.latencyMs}ms redis=${redisHealth.latencyMs}ms`);
+}
 
-wsServer.listen(WS_PORT, '127.0.0.1', async () => {
-  await initialiseRealtimeCursors();
-  setInterval(pollPatrolScans, 10000);
-  setInterval(pollEscalations, 5000);
-  console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
+let server;
+validateStartup().then(() => {
+  server = app.listen(PORT, '127.0.0.1', () => {
+    console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
+  });
+
+  wsServer.listen(WS_PORT, '127.0.0.1', async () => {
+    await initialiseRealtimeCursors();
+    setInterval(pollPatrolScans, 10000);
+    setInterval(pollEscalations, 5000);
+    console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
+  });
+}).catch((err) => {
+  console.error('[Enormity] Startup validation failed:', err.message);
+  process.exit(1);
 });
 
 process.on('SIGTERM', async () => {
@@ -1613,6 +1718,7 @@ process.on('SIGTERM', async () => {
   shuttingDown = true;
   console.log('[Enormity] SIGTERM received - closing server gracefully');
   wsServer.close(() => console.log('[Enormity] WebSocket server closed cleanly'));
+  if (!server) process.exit(0);
   server.close(async () => {
     try { await pool.end(); } catch (err) { console.error('[Enormity] pool close failed:', err.message); }
     try { if (redisReady) await redis.quit(); } catch (err) { console.error('[Enormity] redis close failed:', err.message); }
