@@ -9,6 +9,7 @@ const mysql = require('mysql2/promise');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 const WebSocket = require('ws');
 const Redis = require('ioredis');
@@ -65,6 +66,7 @@ let redisReady = false;
 const cacheCounters = { hits: 0, misses: 0 };
 const patrolStatsCache = { key: null, data: null, timestamp: 0 };
 const PATROL_STATS_TTL_MS = 30 * 1000;
+const REPORT_ARCHIVE_ROOT = process.env.KPM_ARCHIVE_ROOT || '/opt/enormity-sidecar/reports/archive';
 const notifiedEscalations = new Set();
 let shuttingDown = false;
 
@@ -104,6 +106,9 @@ const protectedLimiter = rateLimit({
 
 app.use((req, res, next) => {
   const start = process.hrtime.bigint();
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
   res.setHeader('X-Powered-By', 'Enormity Tech Solutions');
   res.setHeader('X-API-Version', '2.0.0');
   const originalEnd = res.end;
@@ -621,8 +626,8 @@ app.get('/api/enormity/company/list', publicLimiter, async (req, res) => {
       `SELECT COMPANYID AS id,
               COMPANYNAME AS companyName,
               COMPANYCODE AS companyCode
-         FROM companys
-        WHERE IFNULL(IS_Effective, 1) <> 0
+        FROM companys
+        WHERE (IFNULL(IS_Effective, 0) <> 0 OR ENDDATE >= NOW())
         ORDER BY COMPANYNAME ASC`
     );
     return ok(res, rows);
@@ -631,7 +636,204 @@ app.get('/api/enormity/company/list', publicLimiter, async (req, res) => {
   }
 });
 
+app.get('/api/enormity/version', publicLimiter, async (req, res) => {
+  try {
+    const routeCount = app._router.stack.filter((layer) => layer.route).length;
+    const [procedures] = await query(`SELECT COUNT(*) AS totalStoredProcedures FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()`);
+    let totalJavaClasses = 0;
+    try {
+      totalJavaClasses = Number(execSync(`find /opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour -name '*.class' | wc -l`, { encoding: 'utf8' }).trim());
+    } catch (_) {}
+    return ok(res, {
+      version: '3.1.0',
+      buildDate: '2026-04-25',
+      totalEndpoints: routeCount,
+      totalJavaClasses,
+      totalStoredProcedures: Number(procedures.totalStoredProcedures || 0),
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/version', err, 'Failed to build version payload.');
+  }
+});
+
 app.use('/api/enormity', authenticateJwt, protectedLimiter);
+
+app.get('/api/enormity/mobile/dashboard', async (req, res) => {
+  try {
+    const date = validateDateParam(req.query.date);
+    const companyId = optionalCompanyId(req.query.companyId);
+    const [start, end] = dateRange(date);
+    const company = companyWhere(companyId);
+    const [stats, alerts] = await Promise.all([
+      query(
+        `SELECT COUNT(*) AS scans,
+                COUNT(DISTINCT GUARDID) AS guards,
+                COUNT(DISTINCT SITEID) AS sites,
+                MAX(HAPPENTIME) AS lastScan
+           FROM historydatas
+          WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}`,
+        [start, end, ...company.params]
+      ),
+      query(
+        `SELECT COUNT(*) AS activeAlerts
+           FROM enormity_escalations
+          WHERE requiresAck = 1${companyId ? ' AND companyid = ?' : ''}`,
+        companyId ? [companyId] : []
+      ),
+    ]);
+    return ok(res, {
+      date,
+      companyId,
+      scansToday: Number(stats[0]?.scans || 0),
+      activeGuards: Number(stats[0]?.guards || 0),
+      activeSites: Number(stats[0]?.sites || 0),
+      activeAlerts: Number(alerts[0]?.activeAlerts || 0),
+      lastScan: stats[0]?.lastScan || null,
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/mobile/dashboard', err, 'Failed to build mobile dashboard.');
+  }
+});
+
+app.get('/api/enormity/mobile/guard/:id/today', async (req, res) => {
+  try {
+    const guardId = parsePositiveInt(req.params.id, 0);
+    if (!guardId) return fail(res, 400, 'guard id is required.');
+    const date = validateDateParam(req.query.date);
+    const [start, end] = dateRange(date);
+    const [summary, sites] = await Promise.all([
+      query(
+        `SELECT GUARDID AS guardId,
+                GUARDNAME AS guardName,
+                COUNT(*) AS scans,
+                COUNT(DISTINCT SITEID) AS sites,
+                MIN(HAPPENTIME) AS firstScan,
+                MAX(HAPPENTIME) AS lastScan
+           FROM historydatas
+          WHERE GUARDID = ?
+            AND HAPPENTIME BETWEEN ? AND ?
+          GROUP BY GUARDID, GUARDNAME`,
+        [guardId, start, end]
+      ),
+      query(
+        `SELECT SITEID AS siteId, SITENAME AS siteName, COUNT(*) AS scans, MAX(HAPPENTIME) AS lastScan
+           FROM historydatas
+          WHERE GUARDID = ?
+            AND HAPPENTIME BETWEEN ? AND ?
+          GROUP BY SITEID, SITENAME
+          ORDER BY lastScan DESC
+          LIMIT 20`,
+        [guardId, start, end]
+      ),
+    ]);
+    return ok(res, { date, guardId, summary: summary[0] || { guardId, scans: 0, sites: 0 }, sites });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/mobile/guard/:id/today', err, 'Failed to build mobile guard summary.');
+  }
+});
+
+app.post('/api/enormity/mobile/sos', async (req, res) => {
+  try {
+    const guardId = parsePositiveInt(req.body?.guardId, 0);
+    const siteId = parsePositiveInt(req.body?.siteId, 0);
+    const message = String(req.body?.message || 'Mobile SOS').slice(0, 180);
+    if (!guardId || !siteId) return fail(res, 400, 'guardId and siteId are required.');
+    const [guards, sites] = await Promise.all([
+      query(`SELECT g.GUARDID, g.GUARDNAME, g.DEPTID, d.DEPTNAME, d.DEPTSN, d.DEPTCODE, d.COMPANYID
+               FROM guards g LEFT JOIN depts d ON d.DEPTID = g.DEPTID
+              WHERE g.GUARDID = ? LIMIT 1`, [guardId]),
+      query(`SELECT SITEID, SITENAME, SITESN, SITECODE, LONGITUDE, LATITUDE
+               FROM sites WHERE SITEID = ? LIMIT 1`, [siteId]),
+    ]);
+    const guard = guards[0];
+    const site = sites[0];
+    if (!guard || !site) return fail(res, 404, 'Guard or site not found.');
+    const companyId = optionalCompanyId(req.body?.companyId) || Number(guard.COMPANYID || 0);
+    const result = await query(
+      `INSERT INTO alarmdatas
+        (COMPANYID, DEPTID, DEPTNAME, DEPTSN, DEPTCODE, GUARDID, GUARDNAME, SITEID, SITENAME, SITESN, SITECODE,
+         BEGINTIME, ENDTIME, ALARMTYPE, ALARMINFO, READERCODE, HAPPENTIME, INSTANTDATA, LONGITUDE, LATITUDE, PUSHED, MOBILEMEDIA)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1, ?, 'MOBILE', NOW(), 1, ?, ?, 0, 'MOBILE')`,
+      [
+        companyId,
+        guard.DEPTID || 0,
+        guard.DEPTNAME || '',
+        guard.DEPTSN || 0,
+        guard.DEPTCODE || '',
+        guard.GUARDID,
+        guard.GUARDNAME || '',
+        site.SITEID,
+        site.SITENAME || '',
+        site.SITESN || 0,
+        site.SITECODE || '',
+        message,
+        site.LONGITUDE || 0,
+        site.LATITUDE || 0,
+      ]
+    );
+    const alarmId = result.insertId;
+    await query(
+      `INSERT IGNORE INTO enormity_escalations
+        (alarm_id, companyid, alarm_type, guard_name, site_name, severity, status, requiresAck, created_at)
+       VALUES (?, ?, 1, ?, ?, 'CRITICAL', 'ACTIVE', 1, NOW())`,
+      [alarmId, companyId, guard.GUARDNAME || '', site.SITENAME || '']
+    );
+    sendTelegramAlert({ escalationId: alarmId, guardName: guard.GUARDNAME, siteName: site.SITENAME, companyId, createdAt: timestamp() })
+      .catch((err) => console.error('telegram mobile sos failed:', err.message));
+    return ok(res, { alarmId, companyId, severity: 'CRITICAL', status: 'ACTIVE' }, 201);
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/mobile/sos', err, 'Failed to create mobile SOS.');
+  }
+});
+
+app.get('/api/enormity/mobile/sites/:companyId', async (req, res) => {
+  try {
+    const companyId = parsePositiveInt(req.params.companyId, 0);
+    const limit = parsePositiveInt(req.query.limit, 50, 80);
+    if (!companyId) return fail(res, 400, 'companyId is required.');
+    const rows = await query(
+      `SELECT s.SITEID AS id,
+              s.SITENAME AS name,
+              s.SITECODE AS code,
+              s.LONGITUDE AS lng,
+              s.LATITUDE AS lat
+         FROM sites s
+         JOIN depts d ON d.DEPTID = s.DEPTID
+        WHERE d.COMPANYID = ?
+        ORDER BY s.SITENAME ASC
+        LIMIT ${limit}`,
+      [companyId]
+    );
+    return ok(res, { companyId, limit, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/mobile/sites/:companyId', err, 'Failed to fetch mobile site list.');
+  }
+});
+
+app.get('/api/enormity/stats/realtime', async (req, res) => {
+  try {
+    const [rows, cacheStats] = await Promise.all([
+      query(
+        `SELECT SUM(HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)) AS scansLastMinute,
+                SUM(HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 1 HOUR)) AS scansLastHour
+           FROM historydatas
+          WHERE HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 1 HOUR)`
+      ),
+      (async () => {
+        const total = cacheCounters.hits + cacheCounters.misses;
+        return total ? Number(((cacheCounters.hits / total) * 100).toFixed(2)) : 0;
+      })(),
+    ]);
+    return ok(res, {
+      scansLastMinute: Number(rows[0]?.scansLastMinute || 0),
+      scansLastHour: Number(rows[0]?.scansLastHour || 0),
+      activeWebSocketClients: wss.clients.size,
+      cacheHitRate: cacheStats,
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/stats/realtime', err, 'Failed to build realtime stats.');
+  }
+});
 
 app.get('/api/enormity/audit/logs', async (req, res) => {
   try {
@@ -1104,6 +1306,59 @@ app.get('/api/enormity/reports/scorecard', async (req, res) => {
   }
 });
 
+app.get('/api/enormity/kpm/contract-score', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const { month: currentMonth, year: currentYear } = currentMonthYear();
+    const month = parsePositiveInt(req.query.month, currentMonth, 12);
+    const year = parsePositiveInt(req.query.year, currentYear, 2100);
+    const { start, end, daysInMonth } = monthDateRange(month, year);
+    const company = companyWhere(companyId);
+    const [patrol, manpower, devices] = await Promise.all([
+      query(`SELECT COUNT(*) AS scans, COUNT(DISTINCT SITEID) AS sitesVisited, COUNT(DISTINCT DATE(HAPPENTIME)) AS activeDays
+               FROM historydatas
+              WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}`, [start, end, ...company.params]),
+      query(`SELECT COUNT(DISTINCT GUARDID) AS activeGuards
+               FROM historydatas
+              WHERE HAPPENTIME BETWEEN ? AND ?${company.clause}`, [start, end, ...company.params]),
+      query(`SELECT COUNT(*) AS totalDevices,
+                    SUM(CASE WHEN ENDDATE >= CURDATE() THEN 1 ELSE 0 END) AS validDevices,
+                    SUM(CASE WHEN ENDDATE < CURDATE() THEN 1 ELSE 0 END) AS expiredDevices
+               FROM readers
+              WHERE DELETED = 0${company.clause}`, company.params),
+    ]);
+    const scans = Number(patrol[0]?.scans || 0);
+    const activeDays = Number(patrol[0]?.activeDays || 0);
+    const activeGuards = Number(manpower[0]?.activeGuards || 0);
+    const totalDevices = Number(devices[0]?.totalDevices || 0);
+    const validDevices = Number(devices[0]?.validDevices || 0);
+    const patrolFrequencyScore = Math.min(100, Math.round((activeDays / daysInMonth) * 100));
+    const manpowerScore = Math.min(100, Math.round((activeGuards / Math.max(Number(patrol[0]?.sitesVisited || 0), 1)) * 100));
+    const deviceScore = totalDevices ? Math.round((validDevices / totalDevices) * 100) : 0;
+    const overallScore = Number(((patrolFrequencyScore * 0.4) + (manpowerScore * 0.35) + (deviceScore * 0.25)).toFixed(2));
+    const findings = [];
+    const recommendations = [];
+    if (patrolFrequencyScore < 80) { findings.push('Patrol frequency below target.'); recommendations.push('Increase scheduled patrol completion and missed-site follow-up.'); }
+    if (manpowerScore < 80) { findings.push('Manpower coverage below target.'); recommendations.push('Review guard allocation against active patrol sites.'); }
+    if (deviceScore < 90) { findings.push('Device licence or validity risk detected.'); recommendations.push('Prioritise reader renewal and maintenance.'); }
+    return ok(res, {
+      companyId,
+      month,
+      year,
+      patrolFrequencyScore,
+      manpowerScore,
+      deviceScore,
+      overallScore,
+      grade: gradeFromCompliance(overallScore),
+      findings,
+      recommendations,
+      evidence: { scans, activeDays, activeGuards, totalDevices, validDevices, expiredDevices: Number(devices[0]?.expiredDevices || 0) },
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/kpm/contract-score', err, 'Failed to build KPM contract score.');
+  }
+});
+
 app.get('/api/enormity/devices/expiring', async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 30, 365);
@@ -1237,6 +1492,67 @@ app.get('/api/enormity/alerts/unacknowledged', async (req, res) => {
   }
 });
 
+app.get('/api/enormity/alerts/active', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const params = [];
+    let sql = `SELECT escalation_id AS id,
+                      alarm_id AS alarmId,
+                      companyid AS companyId,
+                      alarm_type AS alarmType,
+                      guard_name AS guardName,
+                      site_name AS siteName,
+                      severity,
+                      status,
+                      created_at AS createdAt,
+                      TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS minutesOpen
+                 FROM enormity_escalations
+                WHERE requiresAck = 1
+                  AND status = 'ACTIVE'`;
+    if (companyId) {
+      sql += ' AND companyid = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY severity = "CRITICAL" DESC, created_at DESC LIMIT 200';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/alerts/active', err, 'Failed to fetch active alerts.');
+  }
+});
+
+app.get('/api/enormity/alerts/history', async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, 365);
+    const companyId = optionalCompanyId(req.query.companyId);
+    const params = [days];
+    let sql = `SELECT escalation_id AS id,
+                      alarm_id AS alarmId,
+                      companyid AS companyId,
+                      alarm_type AS alarmType,
+                      guard_name AS guardName,
+                      site_name AS siteName,
+                      severity,
+                      status,
+                      created_at AS createdAt,
+                      acknowledged_at AS acknowledgedAt,
+                      acknowledged_by AS acknowledgedBy,
+                      resolved_at AS resolvedAt
+                 FROM enormity_escalations
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+                  AND (requiresAck = 0 OR status IN ('ACKNOWLEDGED','RESOLVED'))`;
+    if (companyId) {
+      sql += ' AND companyid = ?';
+      params.push(companyId);
+    }
+    sql += ' ORDER BY COALESCE(acknowledged_at, resolved_at, created_at) DESC LIMIT 500';
+    const rows = await query(sql, params);
+    return ok(res, { companyId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/alerts/history', err, 'Failed to fetch alert history.');
+  }
+});
+
 app.post('/api/enormity/alerts/:id/acknowledge', async (req, res) => {
   try {
     const id = parsePositiveInt(req.params.id, 0);
@@ -1245,8 +1561,9 @@ app.post('/api/enormity/alerts/:id/acknowledge', async (req, res) => {
     await query(
       `UPDATE enormity_escalations
           SET requiresAck = 0,
-              status = 'ACKNOWLEDGED',
+              status = 'RESOLVED',
               acknowledged_at = NOW(),
+              resolved_at = NOW(),
               acknowledged_by = ?
         WHERE escalation_id = ?`,
       [acknowledgedBy, id]
@@ -1271,6 +1588,84 @@ async function companyName(companyId) {
   } catch (_) {
     return `Company ${companyId}`;
   }
+}
+
+async function activeCompanies() {
+  return query(
+    `SELECT COMPANYID AS companyId,
+            COMPANYNAME AS companyName,
+            COMPANYCODE AS companyCode
+      FROM companys
+      WHERE (IFNULL(IS_Effective, 0) <> 0 OR ENDDATE >= NOW())
+      ORDER BY COMPANYNAME ASC`
+  );
+}
+
+function monthArchiveParts(year, month) {
+  const safeYear = Math.max(2000, Number(year) || new Date().getFullYear());
+  const safeMonth = Math.max(1, Math.min(12, Number(month) || 1));
+  const ym = `${safeYear}-${String(safeMonth).padStart(2, '0')}`;
+  const lastDay = new Date(safeYear, safeMonth, 0);
+  const reportDate = `${safeYear}-${String(safeMonth).padStart(2, '0')}-${String(lastDay.getDate()).padStart(2, '0')}`;
+  return { year: safeYear, month: safeMonth, ym, reportDate };
+}
+
+function archivePath(year, month, companyId, filename) {
+  const parts = monthArchiveParts(year, month);
+  return path.join(REPORT_ARCHIVE_ROOT, parts.ym, String(companyId), filename || '');
+}
+
+async function generateCompanyArchive(company, year, month) {
+  const parts = monthArchiveParts(year, month);
+  const dir = archivePath(parts.year, parts.month, company.companyId);
+  fs.mkdirSync(dir, { recursive: true });
+  const name = company.companyName || await companyName(company.companyId);
+  const files = [
+    {
+      filename: 'pkk2.pdf',
+      buffer: await kpmEngine.pkk2({ companyName: name, month: parts.month, year: parts.year, rows: await pkk2Rows(company.companyId, parts.month, parts.year) }),
+    },
+    {
+      filename: 'pkk3.pdf',
+      buffer: await kpmEngine.pkk3({ companyName: name, date: parts.reportDate, rows: await pkk3Rows(company.companyId, parts.reportDate) }),
+    },
+    {
+      filename: 'pkk4.pdf',
+      buffer: await kpmEngine.pkk4({ companyName: name, date: parts.reportDate, rows: await pkk4Rows(company.companyId, parts.reportDate) }),
+    },
+  ];
+  files.forEach((file) => fs.writeFileSync(path.join(dir, file.filename), file.buffer));
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
+    companyId: company.companyId,
+    companyName: name,
+    year: parts.year,
+    month: parts.month,
+    reportDate: parts.reportDate,
+    files: files.map((file) => ({ filename: file.filename, bytes: file.buffer.length })),
+    generatedAt: timestamp(),
+  }, null, 2));
+  return { companyId: company.companyId, companyName: name, path: dir, files: files.map((file) => file.filename) };
+}
+
+let lastArchiveRunKey = '';
+async function runMonthlyArchiveScheduler(force = false) {
+  const now = new Date();
+  const runKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const due = force || (now.getDate() === 1 && now.getHours() === 8 && now.getMinutes() === 0);
+  if (!due || (!force && lastArchiveRunKey === runKey)) return;
+  lastArchiveRunKey = runKey;
+  const target = new Date(now.getFullYear(), now.getMonth(), 0);
+  const year = target.getFullYear();
+  const month = target.getMonth() + 1;
+  const companies = await activeCompanies();
+  for (const company of companies) {
+    try {
+      await generateCompanyArchive(company, year, month);
+    } catch (err) {
+      console.error('[Enormity] KPM monthly archive failed:', company.companyId, err.message);
+    }
+  }
+  console.log(`[Enormity] KPM monthly archive completed for ${year}-${String(month).padStart(2, '0')} companies=${companies.length}`);
 }
 
 function parseMonthYear(req) {
@@ -1436,6 +1831,54 @@ app.get('/api/enormity/reports/daily-scorecard', async (req, res) => {
   }
 });
 
+app.get('/api/enormity/reports/archive', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const year = parsePositiveInt(req.query.year, new Date().getFullYear(), 2100);
+    if (year < 2000) return fail(res, 400, 'Invalid year.');
+    const yearDirs = fs.existsSync(REPORT_ARCHIVE_ROOT) ? fs.readdirSync(REPORT_ARCHIVE_ROOT).filter((name) => name.startsWith(`${year}-`)) : [];
+    const reports = [];
+    yearDirs.sort().forEach((ym) => {
+      const monthDir = path.join(REPORT_ARCHIVE_ROOT, ym);
+      fs.readdirSync(monthDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).forEach((entry) => {
+        const cid = Number(entry.name);
+        if (companyId && cid !== companyId) return;
+        const dir = path.join(monthDir, entry.name);
+        const manifestPath = path.join(dir, 'manifest.json');
+        let manifest = {};
+        try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch (_) {}
+        reports.push({
+          year,
+          month: Number(ym.slice(5, 7)),
+          companyId: cid,
+          companyName: manifest.companyName || null,
+          files: ['pkk2.pdf', 'pkk3.pdf', 'pkk4.pdf'].filter((file) => fs.existsSync(path.join(dir, file))),
+          generatedAt: manifest.generatedAt || null,
+        });
+      });
+    });
+    return ok(res, { companyId, year, reports });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/reports/archive', err, 'Failed to list archived reports.');
+  }
+});
+
+app.get('/api/enormity/reports/archive/:year/:month/:companyId/pkk4.pdf', async (req, res) => {
+  try {
+    const year = parsePositiveInt(req.params.year, 0, 2100);
+    const month = parsePositiveInt(req.params.month, 0, 12);
+    const companyId = parsePositiveInt(req.params.companyId, 0);
+    if (!year || year < 2000 || !month || !companyId) return fail(res, 400, 'Invalid archive path.');
+    const filePath = archivePath(year, month, companyId, 'pkk4.pdf');
+    if (!fs.existsSync(filePath)) return fail(res, 404, 'Archived PKK4 report not found.');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="PKK4_${year}_${String(month).padStart(2, '0')}_${companyId}.pdf"`);
+    return fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/reports/archive/:year/:month/:companyId/pkk4.pdf', err, 'Failed to download archived PKK4 report.');
+  }
+});
+
 app.post('/api/enormity/reports/kpm', async (req, res) => {
   try {
     const { type, companyId = '', date: requestedDate } = req.body || {};
@@ -1558,6 +2001,39 @@ app.get('/api/enormity/devices/:readerCode/notes', async (req, res) => {
   }
 });
 
+app.get('/api/enormity/devices/maintenance-due', async (req, res) => {
+  try {
+    const companyId = optionalCompanyId(req.query.companyId);
+    const days = parsePositiveInt(req.query.days, 90, 365);
+    const params = [];
+    let sql = `SELECT r.READERCODE AS readerCode,
+                      COALESCE(r.NAME, r.LASTCONTENT, r.READERCODE) AS readerName,
+                      r.COMPANYID AS companyId,
+                      c.COMPANYNAME AS companyName,
+                      MAX(n.createdAt) AS lastServiceAt,
+                      DATEDIFF(CURDATE(), DATE(MAX(n.createdAt))) AS daysSinceService
+                 FROM readers r
+            LEFT JOIN companys c ON c.COMPANYID = r.COMPANYID
+            LEFT JOIN enormity_device_notes n
+                   ON n.readerCode = r.READERCODE
+                  AND n.noteType IN ('MAINTENANCE','REPLACEMENT')
+                WHERE r.DELETED = 0`;
+    if (companyId) {
+      sql += ' AND r.COMPANYID = ?';
+      params.push(companyId);
+    }
+    sql += ` GROUP BY r.READERCODE, r.NAME, r.LASTCONTENT, r.COMPANYID, c.COMPANYNAME
+              HAVING lastServiceAt IS NULL OR lastServiceAt < DATE_SUB(NOW(), INTERVAL ? DAY)
+              ORDER BY lastServiceAt IS NULL DESC, lastServiceAt ASC
+              LIMIT 500`;
+    params.push(days);
+    const rows = await query(sql, params);
+    return ok(res, { companyId, days, rows });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/devices/maintenance-due', err, 'Failed to fetch maintenance due devices.');
+  }
+});
+
 const wsServer = http.createServer();
 const wss = new WebSocket.Server({ server: wsServer });
 let lastScanId = 0;
@@ -1638,6 +2114,48 @@ async function sendTelegramAlert(escalation) {
   }, { timeout: 5000 });
 }
 
+async function pollCriticalSosAlarms() {
+  try {
+    const rows = await query(
+      `SELECT a.ID AS alarmId,
+              a.COMPANYID AS companyId,
+              a.ALARMTYPE AS alarmType,
+              a.GUARDNAME AS guardName,
+              a.SITENAME AS siteName,
+              a.HAPPENTIME AS happenTime
+         FROM alarmdatas a
+    LEFT JOIN enormity_escalations e ON e.alarm_id = a.ID
+        WHERE a.ALARMTYPE = 1
+          AND e.escalation_id IS NULL
+          AND a.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+        ORDER BY a.ID ASC
+        LIMIT 50`
+    );
+    for (const row of rows) {
+      await query(
+        `INSERT IGNORE INTO enormity_escalations
+          (alarm_id, companyid, alarm_type, guard_name, site_name, severity, status, requiresAck, created_at)
+         VALUES (?, ?, ?, ?, ?, 'CRITICAL', 'ACTIVE', 1, NOW())`,
+        [row.alarmId, row.companyId, row.alarmType, row.guardName, row.siteName]
+      );
+      const escalation = {
+        escalationId: row.alarmId,
+        alarmId: row.alarmId,
+        companyId: row.companyId,
+        alarmType: row.alarmType,
+        guardName: row.guardName,
+        siteName: row.siteName,
+        severity: 'CRITICAL',
+        createdAt: row.happenTime,
+      };
+      broadcast({ event: 'NEW_ALARM', ...escalation });
+      sendTelegramAlert(escalation).catch((err) => console.error('telegram sos failed:', err.message));
+    }
+  } catch (err) {
+    console.error('critical sos poll failed:', err.message);
+  }
+}
+
 async function pollEscalations() {
   try {
     const rows = await query(
@@ -1705,7 +2223,9 @@ validateStartup().then(() => {
   wsServer.listen(WS_PORT, '127.0.0.1', async () => {
     await initialiseRealtimeCursors();
     setInterval(pollPatrolScans, 10000);
+    setInterval(pollCriticalSosAlarms, 5000);
     setInterval(pollEscalations, 5000);
+    setInterval(() => runMonthlyArchiveScheduler(false).catch((err) => console.error('[Enormity] archive scheduler failed:', err.message)), 60000);
     console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
   });
 }).catch((err) => {

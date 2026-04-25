@@ -197,3 +197,124 @@ paths:
       security: [{ bearerAuth: [] }]
       responses:
         '200': { description: ZIP stream }
+  /api/enormity/mobile/dashboard:
+    get:
+      summary: Mobile dashboard under 5KB for React Native guard app
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Compact daily stats }
+  /api/enormity/mobile/guard/{id}/today:
+    get:
+      summary: Single guard daily mobile summary
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: Guard scan count, first scan, last scan, and recent sites }
+  /api/enormity/mobile/sos:
+    post:
+      summary: Trigger SOS from mobile guard app
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [guardId, siteId]
+              properties:
+                guardId: { type: integer }
+                siteId: { type: integer }
+                companyId: { type: integer }
+                message: { type: string }
+      responses:
+        '201': { description: SOS alarm and critical escalation created }
+  /api/enormity/mobile/sites/{companyId}:
+    get:
+      summary: Compact patrol site list for mobile app
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: companyId
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Site id, name, code, coordinates, and dept id }
+  /api/enormity/reports/archive:
+    get:
+      summary: List archived monthly KPM report PDFs
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyId
+          schema: { type: integer }
+        - in: query
+          name: year
+          schema: { type: integer }
+      responses:
+        '200': { description: Available archive manifests }
+  /api/enormity/reports/archive/{year}/{month}/{companyId}/pkk4.pdf:
+    get:
+      summary: Download archived monthly PKK4 PDF
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: year
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: month
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: companyId
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: PDF stream }
+  /api/enormity/alerts/active:
+    get:
+      summary: Active unacknowledged SOS and escalation alerts
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Active alert rows }
+  /api/enormity/alerts/history:
+    get:
+      summary: Resolved or acknowledged alert history
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: days
+          schema: { type: integer }
+      responses:
+        '200': { description: Alert lifecycle history }
+  /api/enormity/kpm/contract-score:
+    get:
+      summary: Weighted KPM contract scorecard
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Patrol, manpower, device and overall score }
+  /api/enormity/version:
+    get:
+      summary: Live Enormity system version and evidence counters
+      responses:
+        '200': { description: Version, build date, endpoint count, Java class count, stored procedure count }
+  /api/enormity/stats/realtime:
+    get:
+      summary: Realtime scan, WebSocket, and cache counters
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Realtime operational counters }
