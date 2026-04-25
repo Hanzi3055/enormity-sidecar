@@ -1,15 +1,17 @@
 {
   "name": "enormity-sidecar",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Enormity Nexus sidecar API for CloudPatrol operations, KPM reporting, and MySTI evidence.",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check kpm-engine.js",
+    "smoke": "bash scripts/smoke-test.sh",
+    "ci": "bash scripts/ci-sidecar.sh"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Enormity Tech Solutions",
+  "license": "UNLICENSED",
   "dependencies": {
     "archiver": "^7.0.1",
     "axios": "^1.15.2",
