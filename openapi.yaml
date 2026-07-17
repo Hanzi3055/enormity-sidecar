@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Enormity Nexus Sidecar API
-  version: 2.0.0
+  version: 3.2.0
 servers:
   - url: https://nexus.enormity.tech
 components:
@@ -164,6 +164,116 @@ paths:
                 global: { type: boolean }
       responses:
         '200': { description: One-time realtime ticket }
+  /api/enormity/nexus/v2/locations/search:
+    post:
+      summary: Search bounded same-company guard, device, or site locations
+      description: Internal Nexus Core route. companyId is derived by the portal from its authenticated server session; browsers cannot call this service directly.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [companyId, query]
+              properties:
+                companyId: { type: integer, minimum: 1 }
+                query: { type: string, minLength: 2, maxLength: 80 }
+                entityType: { type: string, enum: [guard, device, site] }
+      responses:
+        '200': { description: At most five company-scoped location cards }
+        '400': { description: Invalid server scope or search }
+  /api/enormity/nexus/v2/assistant/metrics:
+    post:
+      summary: Execute up to two allowlisted read-only Assistant metric tools
+      description: Internal Nexus Core route; arbitrary SQL and caller-selected tenant filters are not accepted.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [companyId, tools]
+              properties:
+                companyId: { type: integer, minimum: 1 }
+                tools:
+                  type: array
+                  minItems: 1
+                  maxItems: 2
+                  uniqueItems: true
+                  items:
+                    type: string
+                    enum: [attendance_summary, shift_summary, patrol_completion_summary, omissions_summary, fingerprint_metadata]
+                dateFrom: { type: string, format: date }
+                dateTo: { type: string, format: date }
+      responses:
+        '200': { description: Grounded company-scoped aggregates }
+        '400': { description: Invalid tool, date range, or scope }
+  /api/enormity/nexus/v2/contracts/query:
+    post:
+      summary: Execute one typed direct setup/report read contract
+      description: Internal Nexus Core route. Only registered contract IDs and bounded filters are accepted.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [companyId, contractId]
+              properties:
+                companyId: { type: integer, minimum: 1 }
+                contractId: { type: string, pattern: '^[a-z0-9][a-z0-9-]{2,80}$' }
+                filters: { type: object }
+                limit: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        '200': { description: Typed rows with direct-source provenance }
+        '400': { description: Invalid or tenant-bearing filters }
+        '404': { description: Contract is not registered }
+  /api/enormity/nexus/v2/biometrics/metadata:
+    post:
+      summary: Read fingerprint metadata without templates or raw reader identifiers
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [companyId]
+              properties:
+                companyId: { type: integer, minimum: 1 }
+                guardId: { type: integer, minimum: 1 }
+      responses:
+        '200': { description: Metadata-only fingerprint records with opaque references }
+        '400': { description: Invalid company or guard scope }
+  /api/enormity/nexus/v2/commands/{area}/{operation}:
+    post:
+      summary: Certified typed command boundary
+      description: Mutations are globally locked and uninstalled handlers never fall back to OEM.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: area, required: true, schema: { type: string } }
+        - { in: path, name: operation, required: true, schema: { type: string } }
+      responses:
+        '501': { description: Registered command handler is not installed }
+        '503': { description: Writes are globally disabled }
+  /api/enormity/nexus/v2/biometrics/{operation}:
+    post:
+      summary: Exact-release-certified biometric command boundary
+      description: Templates are accepted only by a future protected enrollment handler. This release remains locked and has no OEM fallback.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: operation, required: true, schema: { type: string, enum: [save, rename, link, unlink, delete] } }
+      responses:
+        '423': { description: Physical certification is not bound to this release }
+        '501': { description: Certified handler is not installed }
+        '503': { description: Writes are globally disabled }
   /api/enormity/patrol/summary:
     get:
       security: [{ bearerAuth: [] }]

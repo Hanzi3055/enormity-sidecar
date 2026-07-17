@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check kpm-engine.js",
+    "test:nexus-v2-contract": "node scripts/test-nexus-core-v2.js",
     "test:tenant-scope": "node scripts/test-tenant-scope.js",
     "smoke": "bash scripts/smoke-test.sh",
     "ci": "bash scripts/ci-sidecar.sh"
@@ -16,7 +17,6 @@
   "dependencies": {
     "archiver": "^7.0.1",
     "axios": "^1.18.1",
-    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
     "express-rate-limit": "^8.6.0",
