@@ -21,6 +21,16 @@ services:
       REDIS_PORT: 16379
       KPM_ARCHIVE_ROOT: /app/reports/archive
       CONTAINER_STATUS_FILE: /run/enormity/container-status.tsv
+      ENORMITY_BACKGROUND_WRITES_ENABLED: "0"
+      NEXUS_DB_IDENTITY_STRICT: "1"
+      NEXUS_QUERY_MYSQL_USER: nexus_query
+      NEXUS_QUERY_MYSQL_PASSWORD_FILE: /run/secrets/nexus_query_mysql_password
+      NEXUS_COMMAND_MYSQL_USER: nexus_command
+      NEXUS_COMMAND_MYSQL_PASSWORD_FILE: /run/secrets/nexus_command_mysql_password
+      NEXUS_IDENTITY_MYSQL_USER: nexus_identity
+      NEXUS_IDENTITY_MYSQL_PASSWORD_FILE: /run/secrets/nexus_identity_mysql_password
+      NEXUS_BIOMETRIC_MYSQL_USER: nexus_biometric
+      NEXUS_BIOMETRIC_MYSQL_PASSWORD_FILE: /run/secrets/nexus_biometric_mysql_password
     ports:
       - "127.0.0.1:3100:3100"
       - "127.0.0.1:3101:3101"
@@ -28,6 +38,11 @@ services:
       - ./reports/archive:/app/reports/archive
       - /opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour:/opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour:ro
       - /run/enormity/container-status.tsv:/run/enormity/container-status.tsv:ro
+    secrets:
+      - nexus_query_mysql_password
+      - nexus_command_mysql_password
+      - nexus_identity_mysql_password
+      - nexus_biometric_mysql_password
     networks:
       - cloudpatrol
     read_only: true
@@ -51,3 +66,13 @@ networks:
   cloudpatrol:
     external: true
     name: cloudpatrol_default
+
+secrets:
+  nexus_query_mysql_password:
+    file: ${NEXUS_QUERY_MYSQL_PASSWORD_FILE:?Set NEXUS_QUERY_MYSQL_PASSWORD_FILE}
+  nexus_command_mysql_password:
+    file: ${NEXUS_COMMAND_MYSQL_PASSWORD_FILE:?Set NEXUS_COMMAND_MYSQL_PASSWORD_FILE}
+  nexus_identity_mysql_password:
+    file: ${NEXUS_IDENTITY_MYSQL_PASSWORD_FILE:?Set NEXUS_IDENTITY_MYSQL_PASSWORD_FILE}
+  nexus_biometric_mysql_password:
+    file: ${NEXUS_BIOMETRIC_MYSQL_PASSWORD_FILE:?Set NEXUS_BIOMETRIC_MYSQL_PASSWORD_FILE}

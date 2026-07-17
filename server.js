@@ -1,7 +1,6 @@
 require('dotenv').config();
 
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
@@ -10,7 +9,6 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
 const WebSocket = require('ws');
 const Redis = require('ioredis');
 const axios = require('axios');
@@ -27,6 +25,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const app = express();
 const startedAt = Date.now();
+const SERVICE_VERSION = '3.2.0';
+const SERVICE_BUILD_DATE = '2026-07-17';
 const PORT = Number(process.env.PORT || 3100);
 const WS_PORT = Number(process.env.WS_PORT || 3101);
 const BIND_HOST = String(process.env.SIDECAR_BIND_HOST || '127.0.0.1').trim();
@@ -34,7 +34,43 @@ const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
 const VALID_API_KEYS = String(process.env.ENORMITY_API_KEYS || '').split(',').map((key) => key.trim()).filter(Boolean);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT || '';
-const BACKGROUND_WRITES_ENABLED = process.env.ENORMITY_BACKGROUND_WRITES_ENABLED !== '0';
+// Writes are opt-in. A missing or misspelled environment value must never
+// make a read-oriented Core release start mutating CloudPatrol state.
+const BACKGROUND_WRITES_ENABLED = process.env.ENORMITY_BACKGROUND_WRITES_ENABLED === '1';
+const ASSISTANT_METRIC_TOOLS = new Set([
+  'attendance_summary',
+  'shift_summary',
+  'patrol_completion_summary',
+  'omissions_summary',
+  'fingerprint_metadata',
+]);
+const READ_ONLY_POST_PATHS = new Set([
+  '/api/enormity/nexus/realtime-ticket',
+  '/api/enormity/nexus/v2/locations/search',
+  '/api/enormity/nexus/v2/assistant/metrics',
+  '/api/enormity/nexus/v2/biometrics/metadata',
+  '/api/enormity/nexus/v2/contracts/query',
+]);
+const NEXUS_DIRECT_CONTRACTS = new Map([
+  ['dept-tree-list', 'departments'],
+  ['dept-tree-site', 'departments'],
+  ['dept-tree-guard', 'departments'],
+  ['dept-tree-user', 'departments'],
+  ['dept-tree-plan', 'departments'],
+  ['dept-tree-event', 'departments'],
+  ['sites-by-dept', 'sites_checkpoints'],
+  ['guards-by-dept', 'guards'],
+  ['guards-all', 'guards'],
+  ['attendance-config', 'shifts'],
+]);
+const NEXUS_COMMAND_AREAS = new Set([
+  'tenant-company', 'sites-checkpoints', 'guards', 'guard-enrollment', 'duty',
+  'clocking-history', 'patrol-plans', 'download-parameters', 'events',
+  'content-notice-voice', 'address-book', 'receipts', 'talk-groups', 'users',
+  'roles', 'devices', 'device-registration', 'cards-licenses', 'mobile-apps',
+  'database-backups',
+]);
+const NEXUS_BIOMETRIC_OPERATIONS = new Set(['save', 'rename', 'link', 'unlink', 'delete']);
 
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required for Enormity sidecar startup.');
@@ -70,6 +106,109 @@ const pool = mysql.createPool({
   timezone: 'local',
   dateStrings: false,
 });
+
+// Dedicated database roles are also fail-safe by default. Disposable local
+// schema probes may explicitly use 0; production Compose always sets 1.
+const NEXUS_DB_IDENTITY_STRICT = process.env.NEXUS_DB_IDENTITY_STRICT !== '0';
+const nexusDbRoles = ['query', 'command', 'identity', 'biometric'];
+const nexusDbIdentityConfig = Object.fromEntries(nexusDbRoles.map((role) => [role, nexusRoleCredentials(role)]));
+const nexusQueryCredentials = nexusDbIdentityConfig.query;
+const nexusQueryPool = mysql.createPool({
+  host: process.env.MYSQL_HOST || '127.0.0.1',
+  port: Number(process.env.MYSQL_PORT || 13306),
+  user: nexusQueryCredentials.configured ? nexusQueryCredentials.user : (process.env.MYSQL_USER || 'root'),
+  password: nexusQueryCredentials.configured ? nexusQueryCredentials.password : (process.env.MYSQL_PASSWORD || ''),
+  database: process.env.MYSQL_DATABASE || 'cloudpatrol',
+  waitForConnections: true,
+  connectionLimit: Number(process.env.NEXUS_QUERY_MYSQL_POOL_LIMIT || 6),
+  queueLimit: 0,
+  connectTimeout: 10000,
+  timezone: 'local',
+  dateStrings: false,
+});
+const nexusRolePools = new Map([['query', nexusQueryPool]]);
+
+function nexusRoleCredentials(role) {
+  const prefix = `NEXUS_${String(role).toUpperCase()}_MYSQL`;
+  const user = String(process.env[`${prefix}_USER`] || '').trim();
+  const passwordFile = String(process.env[`${prefix}_PASSWORD_FILE`] || '').trim();
+  let password = String(process.env[`${prefix}_PASSWORD`] || '');
+  if (passwordFile) {
+    if (!path.isAbsolute(passwordFile)) throw new Error(`${prefix}_PASSWORD_FILE must be absolute.`);
+    const bytes = fs.readFileSync(passwordFile);
+    if (bytes.byteLength < 16 || bytes.byteLength > 4096) throw new Error(`${prefix}_PASSWORD_FILE has an invalid size.`);
+    password = bytes.toString('utf8').trim();
+  }
+  return { user, password, configured: Boolean(user && password) };
+}
+
+function nexusDbIdentityStatus() {
+  const users = nexusDbRoles.map((role) => nexusDbIdentityConfig[role].user).filter(Boolean);
+  const allConfigured = nexusDbRoles.every((role) => nexusDbIdentityConfig[role].configured);
+  return {
+    strict: NEXUS_DB_IDENTITY_STRICT,
+    allConfigured,
+    distinctUsers: users.length === nexusDbRoles.length && new Set(users).size === nexusDbRoles.length,
+    roles: Object.fromEntries(nexusDbRoles.map((role) => [role, { configured: nexusDbIdentityConfig[role].configured }])),
+  };
+}
+
+function requireNexusDbIdentity(role) {
+  if (!NEXUS_DB_IDENTITY_STRICT) return;
+  const status = nexusDbIdentityStatus();
+  if (!nexusDbIdentityConfig[role]?.configured || !status.distinctUsers) {
+    const error = new Error(`The dedicated Nexus ${role} database identity is not ready.`);
+    error.status = 503;
+    error.code = 'E_DB_IDENTITY';
+    throw error;
+  }
+}
+
+function nexusPoolForRole(role) {
+  requireNexusDbIdentity(role);
+  if (nexusRolePools.has(role)) return nexusRolePools.get(role);
+  const credentials = nexusDbIdentityConfig[role];
+  if (!credentials?.configured) {
+    const error = new Error(`The dedicated Nexus ${role} database identity is not configured.`);
+    error.status = 503;
+    error.code = 'E_DB_IDENTITY';
+    throw error;
+  }
+  const rolePool = mysql.createPool({
+    host: process.env.MYSQL_HOST || '127.0.0.1',
+    port: Number(process.env.MYSQL_PORT || 13306),
+    user: credentials.user,
+    password: credentials.password,
+    database: process.env.MYSQL_DATABASE || 'cloudpatrol',
+    waitForConnections: true,
+    connectionLimit: Number(process.env[`NEXUS_${role.toUpperCase()}_MYSQL_POOL_LIMIT`] || 3),
+    queueLimit: 0,
+    connectTimeout: 10000,
+    timezone: 'local',
+    dateStrings: false,
+  });
+  nexusRolePools.set(role, rolePool);
+  return rolePool;
+}
+
+async function withNexusTransaction(role, callback) {
+  if (role !== 'command' && role !== 'identity' && role !== 'biometric') {
+    throw Object.assign(new Error('Invalid Nexus transaction role.'), { status: 500, code: 'E_DB_ROLE' });
+  }
+  const connection = await nexusPoolForRole(role).getConnection();
+  try {
+    await connection.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    await connection.beginTransaction();
+    const result = await callback(connection);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
 
 pool.on('connection', (connection) => {
   poolStats.created += 1;
@@ -119,7 +258,6 @@ const intervalHandles = [];
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet());
-app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 function rateLimitKey(req) {
@@ -219,6 +357,367 @@ function parsePositiveInt(value, fallback, max) {
   const parsed = Number.parseInt(String(value || ''), 10);
   const safe = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   return max ? Math.min(safe, max) : safe;
+}
+
+function nexusDomainSourceMode(domain) {
+  const suffix = String(domain || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  const key = `NEXUS_DOMAIN_SOURCE_${suffix}`;
+  const value = String(process.env[key] || 'direct').trim().toLowerCase();
+  if (value !== 'direct' && value !== 'compare' && value !== 'oem') {
+    throw Object.assign(new Error(`${key} must be direct, compare, or oem.`), { status: 503, code: 'E_SOURCE_MODE' });
+  }
+  return value;
+}
+
+function validateNexusSourceModes(env = process.env) {
+  for (const [key, raw] of Object.entries(env)) {
+    if (!key.startsWith('NEXUS_DOMAIN_SOURCE_')) continue;
+    const value = String(raw || '').trim().toLowerCase();
+    if (value !== 'direct' && value !== 'compare' && value !== 'oem') {
+      throw new Error(`${key} must be direct, compare, or oem.`);
+    }
+  }
+}
+
+function setNexusDirectSourceHeaders(res, domain) {
+  res.setHeader('X-Nexus-Data-Source', 'cloudpatrol-mysql-direct');
+  res.setHeader('X-Nexus-Source-Mode', nexusDomainSourceMode(domain));
+  res.setHeader('Cache-Control', 'private, no-store');
+}
+
+function requireDirectReadMode(res, domain) {
+  if (nexusDomainSourceMode(domain) !== 'oem') return true;
+  fail(res, 503, `The ${domain} direct-read domain is disabled while its source mode is OEM.`, null, 'E_SOURCE_MODE');
+  return false;
+}
+
+function safeAssistantSearch(value) {
+  const text = String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return text.length >= 2 && text.length <= 80 ? text : '';
+}
+
+function assistantEntityType(value) {
+  const type = String(value || '').trim().toLowerCase();
+  return type === 'guard' || type === 'device' || type === 'site' ? type : 'any';
+}
+
+function assistantDateRange(body) {
+  const today = todayString();
+  const from = String(body?.dateFrom || today).trim();
+  const to = String(body?.dateTo || from).trim();
+  if (!isExactAssistantDate(from) || !isExactAssistantDate(to)) {
+    throw Object.assign(new Error('dateFrom and dateTo must use YYYY-MM-DD.'), { status: 400, code: 'E_DATE' });
+  }
+  const fromMs = Date.parse(`${from}T00:00:00Z`);
+  const toMs = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs || toMs - fromMs > 366 * 86400000) {
+    throw Object.assign(new Error('The date range must be valid, ordered, and no longer than 366 days.'), { status: 400, code: 'E_DATE' });
+  }
+  return { from, to };
+}
+
+function isExactAssistantDate(value) {
+  if (!/^20\d{2}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function optionalPositiveInt(value, label) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = normalizeCompanyId(value);
+  if (!parsed) throw Object.assign(new Error(`${label} must be a positive integer.`), { status: 400, code: 'E_FILTER' });
+  return parsed;
+}
+
+function directContractFilters(body) {
+  const source = body && typeof body === 'object' && !Array.isArray(body.filters) && body.filters && typeof body.filters === 'object'
+    ? body.filters
+    : {};
+  const forbidden = Object.keys(source).some((key) => /^(?:company|companyid|companycode|tenant|tenantid|tenantcode)$/i.test(key));
+  if (forbidden) throw Object.assign(new Error('Tenant scope cannot be supplied in contract filters.'), { status: 400, code: 'E_SCOPE' });
+  const valueFor = (...keys) => {
+    for (const key of keys) if (source[key] !== undefined && source[key] !== null && source[key] !== '') return source[key];
+    return null;
+  };
+  return {
+    deptId: optionalPositiveInt(valueFor('DeptID', 'DeptId', 'deptId'), 'DeptID'),
+    guardId: optionalPositiveInt(valueFor('GuardID', 'guardId', 'guardid'), 'GuardID'),
+    limit: parsePositiveInt(body?.limit, 500, 1000),
+  };
+}
+
+async function queryDirectContract(contractId, companyId, filters) {
+  if (contractId.startsWith('dept-tree-')) {
+    const rows = await nexusQuery(
+      `SELECT d.DEPTID,
+              d.DEPTNAME,
+              d.DEPTSN,
+              d.DEPTCODE,
+              d.VALID,
+              d.PARENTDEPTID,
+              d.COMPANYID,
+              d.TIMEZONE,
+              COUNT(*) OVER() AS __nexus_total
+         FROM depts d
+        WHERE d.COMPANYID = ?
+          AND IFNULL(d.VALID, 1) <> 0
+        ORDER BY d.DEPTSN, d.DEPTID
+        LIMIT ${filters.limit}`,
+      [companyId]
+    );
+    return contractRows(rows);
+  }
+  if (contractId === 'sites-by-dept') {
+    const rows = await nexusQuery(
+      `SELECT s.SITEID,
+              s.SITENAME,
+              s.SITESN,
+              s.SITECODE,
+              s.SITETYPE,
+              s.LONGITUDE,
+              s.LATITUDE,
+              s.ERRORSPAN,
+              s.TAG,
+              s.DEPTID,
+              d.DEPTNAME,
+              d.COMPANYID,
+              COUNT(*) OVER() AS __nexus_total
+         FROM sites s
+         JOIN depts d ON d.DEPTID = s.DEPTID
+        WHERE d.COMPANYID = ?
+          AND (? IS NULL OR s.DEPTID = ?)
+        ORDER BY s.SITESN, s.SITEID
+        LIMIT ${filters.limit}`,
+      [companyId, filters.deptId, filters.deptId]
+    );
+    return contractRows(rows);
+  }
+  if (contractId === 'guards-by-dept' || contractId === 'guards-all') {
+    const rows = await nexusQuery(
+      `SELECT g.GUARDID,
+              g.GUARDNAME,
+              g.GUARDSN,
+              g.GUARDCODE,
+              g.TELEPHONE,
+              g.TAG,
+              g.avatar,
+              g.DEPTID,
+              g.guardtype,
+              d.DEPTNAME,
+              d.COMPANYID,
+              COUNT(*) OVER() AS __nexus_total
+         FROM guards g
+         JOIN depts d ON d.DEPTID = g.DEPTID
+        WHERE d.COMPANYID = ?
+          AND (? IS NULL OR g.DEPTID = ?)
+          AND (? IS NULL OR g.GUARDID = ?)
+        ORDER BY g.GUARDSN, g.GUARDID
+        LIMIT ${filters.limit}`,
+      [companyId, contractId === 'guards-all' ? null : filters.deptId, contractId === 'guards-all' ? null : filters.deptId, filters.guardId, filters.guardId]
+    );
+    return contractRows(rows);
+  }
+  if (contractId === 'attendance-config') {
+    const rows = await nexusQuery(
+      `SELECT wc.id,
+              wc.companyid AS COMPANYID,
+              wc.deptid AS DEPTID,
+              wc.category,
+              wc.begintime,
+              wc.endtime,
+              wc.gotoworksiteid,
+              wc.gooffworksiteid,
+              wc.workhour,
+              wc.guardcount,
+              d.DEPTNAME,
+              COUNT(*) OVER() AS __nexus_total
+         FROM worktimeconfig wc
+    LEFT JOIN depts d ON d.DEPTID = wc.deptid AND d.COMPANYID = wc.companyid
+        WHERE wc.companyid = ?
+          AND (? IS NULL OR wc.deptid = ?)
+        ORDER BY wc.deptid, wc.category, wc.id
+        LIMIT ${filters.limit}`,
+      [companyId, filters.deptId, filters.deptId]
+    );
+    return contractRows(rows);
+  }
+  throw Object.assign(new Error('Direct contract is not registered.'), { status: 404, code: 'E_CONTRACT' });
+}
+
+function contractRows(rows) {
+  const total = Number(rows[0]?.__nexus_total || 0);
+  return {
+    total,
+    rows: rows.map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => key !== '__nexus_total'))),
+  };
+}
+
+async function searchGuardLocations(companyId, search) {
+  return nexusQuery(
+    `WITH candidates AS (
+       SELECT g.GUARDID AS entityId,
+              g.GUARDNAME AS entityName,
+              g.GUARDCODE AS entityCode
+         FROM guards g
+         JOIN depts d ON d.DEPTID = g.DEPTID
+        WHERE d.COMPANYID = ?
+          AND (INSTR(LOWER(g.GUARDNAME), LOWER(?)) > 0 OR INSTR(LOWER(g.GUARDCODE), LOWER(?)) > 0)
+        ORDER BY CASE WHEN LOWER(g.GUARDNAME) = LOWER(?) OR LOWER(g.GUARDCODE) = LOWER(?) THEN 0 ELSE 1 END,
+                 g.GUARDNAME,
+                 g.GUARDID
+        LIMIT 6
+     ), latest AS (
+       SELECT r.GUARDID AS entityId,
+              r.LONGITUDE AS longitude,
+              r.LATITUDE AS latitude,
+              r.HAPPENTIME AS observedAt,
+              ROW_NUMBER() OVER (PARTITION BY r.GUARDID ORDER BY r.HAPPENTIME DESC, r.ID DESC) AS rn
+         FROM realdatas r
+         JOIN depts d ON d.DEPTID = r.DEPTID
+         JOIN candidates c ON c.entityId = r.GUARDID
+        WHERE d.COMPANYID = ?
+     )
+     SELECT 'guard' AS entityType,
+            c.entityId,
+            c.entityName,
+            c.entityCode,
+            l.longitude,
+            l.latitude,
+            l.observedAt,
+            'patrol-observation' AS source
+       FROM candidates c
+  LEFT JOIN latest l ON l.entityId = c.entityId AND l.rn = 1`,
+    [companyId, search, search, search, search, companyId]
+  );
+}
+
+async function searchDeviceLocations(companyId, search) {
+  return nexusQuery(
+    `WITH candidates AS (
+       SELECT r.READERID AS entityId,
+              COALESCE(NULLIF(r.NAME, ''), r.READERCODE) AS entityName,
+              r.READERCODE AS entityCode
+         FROM readers r
+        WHERE r.COMPANYID = ?
+          AND r.DELETED = 0
+          AND (INSTR(LOWER(COALESCE(r.NAME, '')), LOWER(?)) > 0 OR INSTR(LOWER(r.READERCODE), LOWER(?)) > 0)
+        ORDER BY CASE WHEN LOWER(COALESCE(r.NAME, '')) = LOWER(?) OR LOWER(r.READERCODE) = LOWER(?) THEN 0 ELSE 1 END,
+                 entityName,
+                 r.READERID
+        LIMIT 6
+     ), latest AS (
+       SELECT c.entityId,
+              rd.LONGITUDE AS longitude,
+              rd.LATITUDE AS latitude,
+              rd.HAPPENTIME AS observedAt,
+              ROW_NUMBER() OVER (PARTITION BY c.entityId ORDER BY rd.HAPPENTIME DESC, rd.ID DESC) AS rn
+         FROM candidates c
+         JOIN realdatas rd ON rd.READERCODE = c.entityCode
+         JOIN depts d ON d.DEPTID = rd.DEPTID
+        WHERE d.COMPANYID = ?
+     )
+     SELECT 'device' AS entityType,
+            c.entityId,
+            c.entityName,
+            c.entityCode,
+            l.longitude,
+            l.latitude,
+            l.observedAt,
+            'device-patrol-observation' AS source
+       FROM candidates c
+  LEFT JOIN latest l ON l.entityId = c.entityId AND l.rn = 1`,
+    [companyId, search, search, search, search, companyId]
+  );
+}
+
+async function searchSiteLocations(companyId, search) {
+  return nexusQuery(
+    `WITH candidates AS (
+       SELECT s.SITEID AS entityId,
+              s.SITENAME AS entityName,
+              s.SITECODE AS entityCode,
+              s.LONGITUDE AS configuredLongitude,
+              s.LATITUDE AS configuredLatitude
+         FROM sites s
+         JOIN depts d ON d.DEPTID = s.DEPTID
+        WHERE d.COMPANYID = ?
+          AND (INSTR(LOWER(s.SITENAME), LOWER(?)) > 0 OR INSTR(LOWER(s.SITECODE), LOWER(?)) > 0)
+        ORDER BY CASE WHEN LOWER(s.SITENAME) = LOWER(?) OR LOWER(s.SITECODE) = LOWER(?) THEN 0 ELSE 1 END,
+                 s.SITENAME,
+                 s.SITEID
+        LIMIT 6
+     ), latest AS (
+       SELECT r.SITEID AS entityId,
+              r.LONGITUDE AS longitude,
+              r.LATITUDE AS latitude,
+              r.HAPPENTIME AS observedAt,
+              ROW_NUMBER() OVER (PARTITION BY r.SITEID ORDER BY r.HAPPENTIME DESC, r.ID DESC) AS rn
+         FROM realdatas r
+         JOIN depts d ON d.DEPTID = r.DEPTID
+         JOIN candidates c ON c.entityId = r.SITEID
+        WHERE d.COMPANYID = ?
+     )
+     SELECT 'site' AS entityType,
+            c.entityId,
+            c.entityName,
+            c.entityCode,
+            COALESCE(l.longitude, c.configuredLongitude) AS longitude,
+            COALESCE(l.latitude, c.configuredLatitude) AS latitude,
+            l.observedAt,
+            CASE WHEN l.entityId IS NULL THEN 'site-configuration' ELSE 'patrol-observation' END AS source
+       FROM candidates c
+  LEFT JOIN latest l ON l.entityId = c.entityId AND l.rn = 1`,
+    [companyId, search, search, search, search, companyId]
+  );
+}
+
+function normalizeAssistantLocation(row) {
+  const entityType = assistantEntityType(row?.entityType);
+  const entityId = normalizeCompanyId(row?.entityId);
+  const name = String(row?.entityName || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (entityType === 'any' || !entityId || !name) return null;
+  let latitude = row.latitude === null || row.latitude === undefined ? null : Number(row.latitude);
+  let longitude = row.longitude === null || row.longitude === undefined ? null : Number(row.longitude);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) latitude = null;
+  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) longitude = null;
+  if (latitude === 0 && longitude === 0) {
+    latitude = null;
+    longitude = null;
+  }
+  if (latitude === null || longitude === null) {
+    latitude = null;
+    longitude = null;
+  }
+  const observedDate = row.observedAt ? new Date(row.observedAt) : null;
+  const observedAt = observedDate && Number.isFinite(observedDate.getTime()) ? observedDate.toISOString() : null;
+  return {
+    entityType,
+    entityId: String(entityId),
+    name,
+    latitude,
+    longitude,
+    source: String(row.source || 'unknown').slice(0, 80),
+    observedAt,
+  };
+}
+
+function numericFields(row, fields) {
+  return Object.fromEntries(fields.map((field) => [field, Math.max(0, Number(row?.[field] || 0))]));
+}
+
+async function countFilesWithSuffix(root, suffix, limit) {
+  let count = 0;
+  const pending = [root];
+  while (pending.length && count < limit) {
+    const directory = pending.pop();
+    const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) pending.push(path.join(directory, entry.name));
+      else if (entry.isFile() && entry.name.endsWith(suffix)) count += 1;
+      if (count >= limit) break;
+    }
+  }
+  return count;
 }
 
 function optionalCompanyId(value) {
@@ -386,6 +885,33 @@ async function query(sql, params = []) {
   }
 }
 
+async function nexusQuery(sql, params = []) {
+  requireNexusDbIdentity('query');
+  let connection;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    if (connection && typeof connection.destroy === 'function') connection.destroy();
+  }, QUERY_TIMEOUT_MS);
+  try {
+    connection = await nexusQueryPool.getConnection();
+    const [rows] = await connection.execute({ sql, timeout: QUERY_TIMEOUT_MS }, params);
+    return rows;
+  } catch (error) {
+    if (timedOut || /timeout/i.test(error.message || '')) {
+      error.code = 'QUERY_TIMEOUT';
+      error.status = 503;
+      error.message = `Nexus query exceeded ${QUERY_TIMEOUT_MS}ms timeout`;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    if (connection && !timedOut) {
+      try { connection.release(); } catch (_) {}
+    }
+  }
+}
+
 function firstResultSet(rows) {
   return Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
 }
@@ -537,7 +1063,7 @@ async function auditRequest(req, res, durationMs) {
   if (!req.originalUrl.startsWith('/api/enormity/')) return;
   try {
     await ensureAuditTable();
-    const params = JSON.stringify({ query: req.query || {}, body: sanitizeAuditBody(req.body || {}) });
+    const params = JSON.stringify({ query: sanitizeAuditBody(req.query || {}), body: sanitizeAuditBody(req.body || {}) });
     await query(
       `INSERT INTO enormity_audit_log (event_type, user_name, ip_address, success, reason, endpoint, request_params, response_code, response_time_ms, created_at)
        VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, NOW())`,
@@ -574,10 +1100,14 @@ async function cleanupAuditLogs(force = false) {
 }
 
 function sanitizeAuditBody(body) {
-  const clean = { ...body };
-  if (clean.apiKey) clean.apiKey = '[redacted]';
-  if (clean.password) clean.password = '[redacted]';
-  return clean;
+  if (Array.isArray(body)) return body.slice(0, 50).map(sanitizeAuditBody);
+  if (!body || typeof body !== 'object') return typeof body === 'string' ? body.slice(0, 500) : body;
+  return Object.fromEntries(Object.entries(body).map(([key, value]) => {
+    if (/api.?key|password|token|secret|credential|query|question|latitude|longitude|coordinate|finger|biometric|template|feather/i.test(key)) {
+      return [key, '[redacted]'];
+    }
+    return [key, sanitizeAuditBody(value)];
+  }));
 }
 
 function authenticateJwt(req, res, next) {
@@ -585,7 +1115,7 @@ function authenticateJwt(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   if (!token) return fail(res, 401, 'Missing bearer token.');
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { issuer: 'enormity-sidecar', audience: 'nexus-core' });
     req.enormityAuth = decoded;
     return next();
   } catch (err) {
@@ -593,8 +1123,13 @@ function authenticateJwt(req, res, next) {
   }
 }
 
-function signAccessToken(subject = 'enormity-sidecar-client', scope = 'api:enormity') {
-  return jwt.sign({ subject, scope }, JWT_SECRET, { expiresIn: '24h' });
+function signAccessToken(subject = 'nexus-portal', scope = 'api:enormity nexus:query nexus:realtime') {
+  return jwt.sign({ subject, scope }, JWT_SECRET, {
+    expiresIn: '10m',
+    issuer: 'enormity-sidecar',
+    audience: 'nexus-core',
+    jwtid: crypto.randomUUID(),
+  });
 }
 
 function requireApiKey(req, res) {
@@ -604,8 +1139,10 @@ function requireApiKey(req, res) {
   if (!matchedKey) {
     return fail(res, 401, 'Invalid API key.');
   }
-  const token = signAccessToken();
-  return ok(res, { token, tokenType: 'Bearer', expiresInSeconds: 86400 });
+  const subject = String(req.body?.client || 'nexus-portal').trim();
+  if (!/^[a-z0-9._:-]{3,80}$/i.test(subject)) return fail(res, 400, 'Invalid service client identifier.');
+  const token = signAccessToken(subject);
+  return ok(res, { token, tokenType: 'Bearer', expiresIn: 600, expiresInSeconds: 600 });
 }
 
 function realtimeTicketDigest(ticket) {
@@ -656,7 +1193,7 @@ app.get('/api/enormity/health', publicLimiter, async (req, res) => {
     const uptimeSeconds = Math.floor(process.uptime());
     return ok(res, {
       service: 'enormity-sidecar',
-      version: '3.0.0',
+      version: SERVICE_VERSION,
       environment: process.env.NODE_ENV || 'production',
       uptimeSeconds,
       uptimeHuman: formatUptime(uptimeSeconds),
@@ -669,6 +1206,7 @@ app.get('/api/enormity/health', publicLimiter, async (req, res) => {
         connected: databaseHealth.connected,
         latencyMs: databaseHealth.latencyMs,
         pool: poolHealthSnapshot(),
+        nexusIdentities: nexusDbIdentityStatus(),
       },
       redis: {
         connected: redisHealth.connected,
@@ -744,7 +1282,7 @@ app.get('/api/enormity/health/db', authenticateJwt, protectedLimiter, async (req
   }
 });
 
-app.get('/api/enormity/status/overview', publicLimiter, async (req, res) => {
+app.get('/api/enormity/status/overview', authenticateJwt, protectedLimiter, async (req, res) => {
   const date = todayString();
   const [start, end] = dateRange(date);
   try {
@@ -783,11 +1321,12 @@ app.get('/api/enormity/status/overview', publicLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/enormity/status/containers', authenticateJwt, protectedLimiter, (req, res) => {
+app.get('/api/enormity/status/containers', authenticateJwt, protectedLimiter, async (req, res) => {
   try {
-    const output = execSync("docker ps --format '{{.Names}}|{{.Status}}|{{.Ports}}'", { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    const rows = output.trim().split('\n').filter(Boolean).map((line) => {
-      const parts = line.split('|');
+    const inventoryPath = String(process.env.CONTAINER_STATUS_FILE || '/run/enormity/container-status.tsv');
+    const output = await fs.promises.readFile(inventoryPath, 'utf8');
+    const rows = output.trim().split('\n').filter(Boolean).slice(0, 500).map((line) => {
+      const parts = line.split('\t');
       return { name: parts[0] || '', status: parts[1] || '', ports: parts[2] || '' };
     });
     return ok(res, { rows });
@@ -799,24 +1338,24 @@ app.get('/api/enormity/status/containers', authenticateJwt, protectedLimiter, (r
 app.post('/api/enormity/auth/token', authLimiter, requireApiKey);
 app.post('/api/enormity/auth/refresh', authLimiter, authenticateJwt, (req, res) => {
   const current = req.enormityAuth || {};
-  const token = signAccessToken(current.subject || 'enormity-sidecar-client', current.scope || 'api:enormity');
-  return ok(res, { token, tokenType: 'Bearer', expiresInSeconds: 86400 });
+  const token = signAccessToken(current.subject || 'nexus-portal', current.scope || 'api:enormity nexus:query nexus:realtime');
+  return ok(res, { token, tokenType: 'Bearer', expiresIn: 600, expiresInSeconds: 600 });
 });
 
-app.get('/api/enormity/docs.json', publicLimiter, (req, res) => {
+app.get('/api/enormity/docs.json', authenticateJwt, protectedLimiter, (req, res) => {
   const specPath = path.join(__dirname, 'openapi.yaml');
   if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
   return ok(res, { format: 'yaml', content: fs.readFileSync(specPath, 'utf8') });
 });
 
-app.get('/api/enormity/docs', publicLimiter, (req, res) => {
+app.get('/api/enormity/docs', authenticateJwt, protectedLimiter, (req, res) => {
   const specPath = path.join(__dirname, 'openapi.yaml');
   if (!fs.existsSync(specPath)) return fail(res, 404, 'OpenAPI specification has not been generated yet.');
   res.type('text/yaml');
   return res.send(fs.readFileSync(specPath, 'utf8'));
 });
 
-app.get('/api/enormity/company/list', publicLimiter, async (req, res) => {
+app.get('/api/enormity/company/list', authenticateJwt, protectedLimiter, async (req, res) => {
   try {
     const rows = await query(
       `SELECT COMPANYID AS id,
@@ -832,17 +1371,18 @@ app.get('/api/enormity/company/list', publicLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/enormity/version', publicLimiter, async (req, res) => {
+app.get('/api/enormity/version', authenticateJwt, protectedLimiter, async (req, res) => {
   try {
     const routeCount = app._router.stack.filter((layer) => layer.route).length;
     const [procedures] = await query(`SELECT COUNT(*) AS totalStoredProcedures FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()`);
-    let totalJavaClasses = 0;
-    try {
-      totalJavaClasses = Number(execSync(`find /opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour -name '*.class' | wc -l`, { encoding: 'utf8' }).trim());
-    } catch (_) {}
+    const totalJavaClasses = await countFilesWithSuffix(
+      '/opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour',
+      '.class',
+      100000
+    ).catch(() => 0);
     return ok(res, {
-      version: '3.1.0',
-      buildDate: '2026-04-25',
+      version: SERVICE_VERSION,
+      buildDate: SERVICE_BUILD_DATE,
       totalEndpoints: routeCount,
       totalJavaClasses,
       totalStoredProcedures: Number(procedures.totalStoredProcedures || 0),
@@ -853,6 +1393,12 @@ app.get('/api/enormity/version', publicLimiter, async (req, res) => {
 });
 
 app.use('/api/enormity', authenticateJwt, protectedLimiter);
+app.use('/api/enormity', (req, res, next) => {
+  if (BACKGROUND_WRITES_ENABLED || req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  const pathOnly = String(req.originalUrl || '').split('?')[0];
+  if (req.method === 'POST' && READ_ONLY_POST_PATHS.has(pathOnly)) return next();
+  return fail(res, 503, 'This sidecar release is read-only; no mutation was attempted.', null, 'E_WRITES_DISABLED');
+});
 
 // Nexus-only live-data boundary. The browser never calls these endpoints
 // directly. Nexus resolves the company code stored in its server-side session,
@@ -1329,6 +1875,267 @@ app.get('/api/enormity/nexus/live-map', async (req, res) => {
     if (status === 400) return fail(res, status, err.message);
     return handleRouteError(res, '/api/enormity/nexus/live-map', err, 'Failed to load direct Nexus map data.');
   }
+});
+
+// Nexus Core V2 read contracts are internal-only (the service is loopback
+// bound) and require the service JWT installed above. The public browser never
+// supplies companyId: the Nexus portal derives it from its authenticated
+// server-side session before calling this boundary.
+app.post('/api/enormity/nexus/v2/locations/search', async (req, res) => {
+  try {
+    if (!requireDirectReadMode(res, 'locations')) return;
+    const companyId = normalizeCompanyId(req.body?.companyId);
+    const search = safeAssistantSearch(req.body?.query);
+    const entityType = assistantEntityType(req.body?.entityType);
+    if (!companyId) return fail(res, 400, 'A positive server-derived companyId is required.');
+    if (!search) return fail(res, 400, 'A location search between 2 and 80 characters is required.');
+
+    const searches = [];
+    if (entityType === 'any' || entityType === 'guard') searches.push(searchGuardLocations(companyId, search));
+    if (entityType === 'any' || entityType === 'device') searches.push(searchDeviceLocations(companyId, search));
+    if (entityType === 'any' || entityType === 'site') searches.push(searchSiteLocations(companyId, search));
+    const rows = (await Promise.all(searches)).flat();
+    const normalizedSearch = search.toLocaleLowerCase('en');
+    const matches = rows
+      .map(normalizeAssistantLocation)
+      .filter(Boolean)
+      .sort((left, right) => {
+        const leftExact = left.name.toLocaleLowerCase('en') === normalizedSearch ? 0 : 1;
+        const rightExact = right.name.toLocaleLowerCase('en') === normalizedSearch ? 0 : 1;
+        if (leftExact !== rightExact) return leftExact - rightExact;
+        return Date.parse(right.observedAt || '') - Date.parse(left.observedAt || '') || left.name.localeCompare(right.name);
+      });
+
+    setNexusDirectSourceHeaders(res, 'locations');
+    return ok(res, {
+      scope: { kind: 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'nexus-core-v2' },
+      generatedAt: timestamp(),
+      ambiguous: matches.length > 1,
+      truncated: matches.length > 5,
+      totalMatches: Math.min(matches.length, 6),
+      matches: matches.slice(0, 5),
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/locations/search', err, 'Failed to search same-company locations.');
+  }
+});
+
+app.post('/api/enormity/nexus/v2/assistant/metrics', async (req, res) => {
+  try {
+    if (!requireDirectReadMode(res, 'assistant_metrics')) return;
+    const companyId = normalizeCompanyId(req.body?.companyId);
+    if (!companyId) return fail(res, 400, 'A positive server-derived companyId is required.');
+    const range = assistantDateRange(req.body || {});
+    const requested = Array.isArray(req.body?.tools)
+      ? [...new Set(req.body.tools.map((value) => String(value || '').trim()).filter((value) => ASSISTANT_METRIC_TOOLS.has(value)))].slice(0, 2)
+      : [];
+    if (!requested.length) return fail(res, 400, 'One or two allowlisted metric tools are required.');
+
+    const result = {};
+    await Promise.all(requested.map(async (tool) => {
+      if (tool === 'attendance_summary') {
+        const rows = await nexusQuery(
+          `SELECT COUNT(*) AS records,
+                  COUNT(DISTINCT guardid) AS guards,
+                  SUM(CASE WHEN gotoworkdatetime IS NOT NULL THEN 1 ELSE 0 END) AS clockIns,
+                  SUM(CASE WHEN gooffworkdatetime IS NOT NULL THEN 1 ELSE 0 END) AS clockOuts,
+                  SUM(CASE WHEN gotoworkdatetime IS NOT NULL AND gooffworkdatetime IS NOT NULL THEN 1 ELSE 0 END) AS completeRecords
+             FROM worktimerecords
+            WHERE companyid = ?
+              AND dataofdate >= ?
+              AND dataofdate < DATE_ADD(?, INTERVAL 1 DAY)`,
+          [companyId, range.from, range.to]
+        );
+        const row = rows[0] || {};
+        result.attendance = numericFields(row, ['records', 'guards', 'clockIns', 'clockOuts', 'completeRecords']);
+      } else if (tool === 'shift_summary') {
+        const rows = await nexusQuery(
+          `SELECT COUNT(*) AS configuredShifts,
+                  COUNT(DISTINCT deptid) AS departments,
+                  SUM(CASE WHEN UPPER(category) = 'A' THEN 1 ELSE 0 END) AS earlyShifts,
+                  SUM(CASE WHEN UPPER(category) = 'B' THEN 1 ELSE 0 END) AS nightShifts,
+                  COALESCE(SUM(guardcount), 0) AS expectedGuards
+             FROM worktimeconfig
+            WHERE companyid = ?`,
+          [companyId]
+        );
+        result.shifts = numericFields(rows[0] || {}, ['configuredShifts', 'departments', 'earlyShifts', 'nightShifts', 'expectedGuards']);
+      } else if (tool === 'patrol_completion_summary' || tool === 'omissions_summary') {
+        const rows = await nexusQuery(
+          `SELECT COUNT(*) AS patrolRounds,
+                  COALESCE(SUM(PLANCOUNT), 0) AS plannedCheckpoints,
+                  COALESCE(SUM(ARRIVEDCOUNT), 0) AS arrivedCheckpoints,
+                  COALESCE(SUM(OMITCOUNT), 0) AS omittedCheckpoints,
+                  SUM(CASE WHEN COALESCE(OMITCOUNT, 0) = 0 THEN 1 ELSE 0 END) AS completeRounds,
+                  SUM(CASE WHEN COALESCE(OMITCOUNT, 0) > 0 THEN 1 ELSE 0 END) AS incompleteRounds
+             FROM tourdatas
+            WHERE COMPANYID = ?
+              AND BEGINTIME >= ?
+              AND BEGINTIME < DATE_ADD(?, INTERVAL 1 DAY)`,
+          [companyId, range.from, range.to]
+        );
+        result.patrol = numericFields(rows[0] || {}, ['patrolRounds', 'plannedCheckpoints', 'arrivedCheckpoints', 'omittedCheckpoints', 'completeRounds', 'incompleteRounds']);
+      } else if (tool === 'fingerprint_metadata') {
+        const rows = await nexusQuery(
+          `SELECT COUNT(DISTINCT fi.ID) AS enrolledFingerprints,
+                  COUNT(DISTINCT fi.GUARDID) AS enrolledGuards,
+                  COUNT(DISTINCT rf.READERCODE) AS linkedReaders
+             FROM fingerinfo fi
+        LEFT JOIN readerfinger rf
+               ON rf.COMPANYID = fi.COMPANYID
+              AND rf.GUARDID = fi.GUARDID
+              AND rf.FINGERID = fi.FINGERID
+            WHERE fi.COMPANYID = ?`,
+          [companyId]
+        );
+        result.fingerprints = numericFields(rows[0] || {}, ['enrolledFingerprints', 'enrolledGuards', 'linkedReaders']);
+      }
+    }));
+
+    setNexusDirectSourceHeaders(res, 'assistant_metrics');
+    return ok(res, {
+      scope: { kind: 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'nexus-core-v2' },
+      generatedAt: timestamp(),
+      dateFrom: range.from,
+      dateTo: range.to,
+      metrics: result,
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/assistant/metrics', err, 'Failed to load same-company assistant metrics.');
+  }
+});
+
+app.post('/api/enormity/nexus/v2/contracts/query', async (req, res) => {
+  try {
+    const companyId = normalizeCompanyId(req.body?.companyId);
+    const contractId = String(req.body?.contractId || '').trim().toLowerCase();
+    const domain = NEXUS_DIRECT_CONTRACTS.get(contractId);
+    if (!companyId) return fail(res, 400, 'A positive server-derived companyId is required.');
+    if (!domain) return fail(res, 404, 'Direct contract is not registered.', null, 'E_CONTRACT');
+    if (!requireDirectReadMode(res, domain)) return;
+    const filters = directContractFilters(req.body || {});
+    const result = await queryDirectContract(contractId, companyId, filters);
+    setNexusDirectSourceHeaders(res, domain);
+    return ok(res, {
+      scope: { kind: 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'nexus-core-v2' },
+      generatedAt: timestamp(),
+      contractId,
+      total: result.total,
+      rows: result.rows,
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/contracts/query', err, 'Failed to load the same-company direct contract.');
+  }
+});
+
+app.post('/api/enormity/nexus/v2/biometrics/metadata', async (req, res) => {
+  try {
+    if (!requireDirectReadMode(res, 'fingerprint_metadata')) return;
+    const companyId = normalizeCompanyId(req.body?.companyId);
+    const guardId = req.body?.guardId === undefined || req.body?.guardId === null || req.body?.guardId === ''
+      ? null
+      : normalizeCompanyId(req.body.guardId);
+    if (!companyId) return fail(res, 400, 'A positive server-derived companyId is required.');
+    if (req.body?.guardId !== undefined && req.body?.guardId !== null && req.body?.guardId !== '' && !guardId) {
+      return fail(res, 400, 'guardId must be a positive integer.');
+    }
+
+    const rows = await nexusQuery(
+      `SELECT fi.ID AS internalId,
+              fi.GUARDID AS guardId,
+              COALESCE(NULLIF(fi.FINGERNAME, ''), 'Fingerprint') AS label,
+              COALESCE(NULLIF(r.NAME, ''), 'Linked reader') AS readerName,
+              CASE WHEN rf.ID IS NULL THEN 0 ELSE 1 END AS linked
+         FROM fingerinfo fi
+         JOIN guards g ON g.GUARDID = fi.GUARDID
+         JOIN depts d ON d.DEPTID = g.DEPTID AND d.COMPANYID = fi.COMPANYID
+    LEFT JOIN readerfinger rf
+           ON rf.COMPANYID = fi.COMPANYID
+          AND rf.GUARDID = fi.GUARDID
+          AND rf.FINGERID = fi.FINGERID
+    LEFT JOIN readers r
+           ON r.COMPANYID = fi.COMPANYID
+          AND r.READERCODE = rf.READERCODE
+        WHERE fi.COMPANYID = ?
+          AND (? IS NULL OR fi.GUARDID = ?)
+        ORDER BY fi.GUARDID, fi.FINGERSN, fi.ID
+        LIMIT 1000`,
+      [companyId, guardId, guardId]
+    );
+    const grouped = new Map();
+    for (const row of rows) {
+      const reference = crypto.createHmac('sha256', JWT_SECRET)
+        .update(`fingerprint-metadata\0${companyId}\0${row.guardId}\0${row.internalId}`)
+        .digest('base64url')
+        .slice(0, 32);
+      const current = grouped.get(reference) || {
+        reference,
+        label: String(row.label || 'Fingerprint').slice(0, 120),
+        enrolled: true,
+        readers: [],
+        enrolledAt: null,
+        updatedAt: null,
+      };
+      if (Number(row.linked) === 1 && row.readerName) {
+        const readerName = String(row.readerName).slice(0, 120);
+        if (!current.readers.includes(readerName)) current.readers.push(readerName);
+      }
+      grouped.set(reference, current);
+    }
+    const records = [...grouped.values()].slice(0, 500);
+    setNexusDirectSourceHeaders(res, 'fingerprint_metadata');
+    return ok(res, {
+      scope: { kind: 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'nexus-core-v2' },
+      generatedAt: timestamp(),
+      total: records.length,
+      records,
+      redaction: 'metadata-only',
+    });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/biometrics/metadata', err, 'Failed to load same-company fingerprint metadata.');
+  }
+});
+
+// Direct commands are registered domain by domain. An unregistered handler is
+// never retried through OEM. This endpoint remains behind the global write
+// lock until the matching domain, database grants, and exact release are
+// certified.
+app.post('/api/enormity/nexus/v2/commands/:area/:operation', async (req, res) => {
+  const area = String(req.params.area || '').trim().toLowerCase();
+  const operation = String(req.params.operation || '').trim().toLowerCase();
+  if (!NEXUS_COMMAND_AREAS.has(area) || !/^[a-z][a-z0-9-]{1,63}$/.test(operation)) {
+    return fail(res, 404, 'Nexus command handler is not registered.', null, 'E_COMMAND_HANDLER');
+  }
+  try {
+    requireNexusDbIdentity('command');
+  } catch (error) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/commands', error, 'The direct command database identity is unavailable.');
+  }
+  return fail(res, 501, 'This direct command handler is not installed; no OEM fallback was attempted.', { area, operation }, 'E_COMMAND_HANDLER');
+});
+
+app.post('/api/enormity/nexus/v2/biometrics/:operation', async (req, res) => {
+  const operation = String(req.params.operation || '').trim().toLowerCase();
+  if (!NEXUS_BIOMETRIC_OPERATIONS.has(operation)) return fail(res, 404, 'Biometric operation is not registered.', null, 'E_BIOMETRIC_OPERATION');
+  const releaseSha = String(process.env.NEXUS_RELEASE_GIT_SHA || '').trim();
+  const releaseId = String(process.env.NEXUS_RELEASE_ID || '').trim();
+  const certified = process.env.NEXUS_BIOMETRIC_WRITES_ENABLED === '1'
+    && process.env.NEXUS_BIOMETRIC_CERTIFICATION_STATUS === 'PASS'
+    && /^[a-f0-9]{40}$/i.test(releaseSha)
+    && releaseSha === String(process.env.NEXUS_BIOMETRIC_CERTIFIED_GIT_SHA || '').trim()
+    && releaseId
+    && releaseId === String(process.env.NEXUS_BIOMETRIC_CERTIFIED_RELEASE_ID || '').trim();
+  if (!certified) return fail(res, 423, 'Fingerprint writes are locked until physical certification is bound to this exact release.', null, 'E_BIOMETRIC_LOCKED');
+  try {
+    requireNexusDbIdentity('biometric');
+  } catch (error) {
+    return handleRouteError(res, '/api/enormity/nexus/v2/biometrics', error, 'The biometric database identity is unavailable.');
+  }
+  return fail(res, 501, 'The certified biometric handler is not installed; no OEM fallback was attempted.', null, 'E_BIOMETRIC_HANDLER');
 });
 
 app.post('/api/enormity/nexus/realtime-ticket', (req, res) => {
@@ -2986,10 +3793,19 @@ async function validateStartup() {
   if (!process.env.MYSQL_USER) missing.push('MYSQL_USER');
   if (!process.env.MYSQL_DATABASE) missing.push('MYSQL_DATABASE');
   if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  validateNexusSourceModes();
   const databaseHealth = await getDatabaseHealth();
   if (!databaseHealth.connected) throw new Error('Database startup check failed.');
   const redisHealth = await getRedisHealth();
   if (!redisHealth.connected) throw new Error('Redis startup check failed.');
+  if (NEXUS_DB_IDENTITY_STRICT) {
+    const identityStatus = nexusDbIdentityStatus();
+    if (!identityStatus.allConfigured || !identityStatus.distinctUsers) throw new Error('Dedicated Nexus database identities are incomplete or reused.');
+    await Promise.all(nexusDbRoles.map(async (role) => {
+      const rolePool = nexusPoolForRole(role);
+      await rolePool.query({ sql: 'SELECT 1', timeout: QUERY_TIMEOUT_MS });
+    }));
+  }
   console.log(`[Enormity] Startup checks passed: db=${databaseHealth.latencyMs}ms redis=${redisHealth.latencyMs}ms`);
 }
 
