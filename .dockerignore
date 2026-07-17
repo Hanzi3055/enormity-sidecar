@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+reports
+logs
+*.log
+*.pid
+*.bak
+*.bak-*
+*.p12
+*.pem
+*.key
+*.crt
+.DS_Store
+._*

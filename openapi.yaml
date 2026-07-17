@@ -10,6 +10,17 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+  parameters:
+    nexusCompanyId:
+      in: query
+      name: companyId
+      schema: { type: integer, minimum: 1 }
+      description: Required for company scope; mutually exclusive with global.
+    nexusGlobal:
+      in: query
+      name: global
+      schema: { type: integer, enum: [1] }
+      description: Super-admin scope; mutually exclusive with companyId.
 paths:
   /api/enormity/health:
     get:
@@ -52,6 +63,107 @@ paths:
           description: Token issued
         '401':
           description: Invalid API key
+  /api/enormity/nexus/tenant-scope:
+    get:
+      summary: Resolve an exact Nexus session company code to its numeric database scope
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: companyCode
+          required: true
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200': { description: Exact company scope }
+        '404': { description: Company scope not found }
+        '409': { description: Company code is not unique }
+  /api/enormity/nexus/dashboard:
+    get:
+      summary: Tenant-scoped direct MySQL dashboard snapshot
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+      responses:
+        '200': { description: Dashboard snapshot with verified provenance }
+  /api/enormity/nexus/departments:
+    get:
+      summary: Tenant-scoped direct MySQL department hierarchy rows
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+      responses:
+        '200': { description: Sanitized department rows }
+  /api/enormity/nexus/logs:
+    get:
+      summary: Tenant-scoped direct MySQL administrative logs
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+        - in: query
+          name: BeginTime
+          schema: { type: string, example: '2026-07-17 00:00:00' }
+        - in: query
+          name: EndTime
+          schema: { type: string, example: '2026-07-17 23:59:59' }
+        - in: query
+          name: current
+          schema: { type: integer, minimum: 1, maximum: 10000 }
+        - in: query
+          name: pageSize
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200': { description: Paginated administrative logs }
+  /api/enormity/nexus/guards:
+    get:
+      summary: Tenant-scoped guard roster and optional recent activity
+      description: Returns fingerprint counts only; biometric templates are never returned.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+        - in: query
+          name: deptId
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: guardId
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200': { description: Sanitized guard roster }
+  /api/enormity/nexus/live-map:
+    get:
+      summary: Tenant-scoped direct MySQL map telemetry
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+      responses:
+        '200': { description: Current map rows with verified provenance }
+  /api/enormity/nexus/alerts/unacknowledged:
+    get:
+      summary: Tenant-scoped direct MySQL unacknowledged alert count
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/nexusCompanyId'
+        - $ref: '#/components/parameters/nexusGlobal'
+      responses:
+        '200': { description: Sanitized aggregate count }
+  /api/enormity/nexus/realtime-ticket:
+    post:
+      summary: Issue a short-lived single-use ticket for the tenant WebSocket
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                companyId: { type: integer, minimum: 1 }
+                global: { type: boolean }
+      responses:
+        '200': { description: One-time realtime ticket }
   /api/enormity/patrol/summary:
     get:
       security: [{ bearerAuth: [] }]

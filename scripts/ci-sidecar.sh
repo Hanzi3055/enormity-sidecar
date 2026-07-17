@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ -d /opt/enormity-sidecar ]; then
-  cd /opt/enormity-sidecar
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$(dirname "$SCRIPT_DIR")"
 
 echo "=== Enormity Sidecar CI ==="
 node --check server.js
 node --check kpm-engine.js
+node --check realtime-scope.js
+node scripts/test-tenant-scope.js
 
 echo "=== Required Evidence Files ==="
 test -s README.md

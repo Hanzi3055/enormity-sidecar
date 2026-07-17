@@ -15,6 +15,7 @@ const WebSocket = require('ws');
 const Redis = require('ioredis');
 const axios = require('axios');
 const kpmEngine = require('./kpm-engine');
+const { canReceiveRealtimeEvent, normalizeCompanyId, normalizeRealtimeScope } = require('./realtime-scope');
 
 process.on('uncaughtException', (err) => {
   console.error('[Enormity] Uncaught exception:', err && err.message, err && err.stack);
@@ -28,10 +29,12 @@ const app = express();
 const startedAt = Date.now();
 const PORT = Number(process.env.PORT || 3100);
 const WS_PORT = Number(process.env.WS_PORT || 3101);
+const BIND_HOST = String(process.env.SIDECAR_BIND_HOST || '127.0.0.1').trim();
 const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
 const VALID_API_KEYS = String(process.env.ENORMITY_API_KEYS || '').split(',').map((key) => key.trim()).filter(Boolean);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT || '';
+const BACKGROUND_WRITES_ENABLED = process.env.ENORMITY_BACKGROUND_WRITES_ENABLED !== '0';
 
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required for Enormity sidecar startup.');
@@ -104,6 +107,9 @@ const cacheCounters = { hits: 0, misses: 0 };
 const patrolStatsCache = { key: null, data: null, timestamp: 0 };
 const PATROL_STATS_TTL_MS = 30 * 1000;
 const REPORT_ARCHIVE_ROOT = process.env.KPM_ARCHIVE_ROOT || '/opt/enormity-sidecar/reports/archive';
+const REALTIME_TICKET_TTL_MS = 30 * 1000;
+const REALTIME_TICKET_LIMIT = 1000;
+const realtimeTickets = new Map();
 const notifiedEscalations = new Set();
 let shuttingDown = false;
 let acceptingRequests = true;
@@ -130,7 +136,10 @@ const publicLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  // A standalone Next build has several isolated server bundles, each with a
+  // process-local token cache. Allow one exchange per bundle while retaining
+  // a strict per-IP ceiling for the high-entropy service key.
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: rateLimitKey,
@@ -235,6 +244,31 @@ function validateDateParam(dateValue) {
     throw err;
   }
   return date;
+}
+
+function nexusDateTime(value, fallback) {
+  const text = String(value || fallback || '').trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) {
+    const err = new Error('Invalid date-time format. Expected YYYY-MM-DD HH:mm:ss.');
+    err.status = 400;
+    throw err;
+  }
+  const parts = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2], parts[3], parts[4], parts[5]));
+  if (
+    date.getUTCFullYear() !== parts[0]
+    || date.getUTCMonth() + 1 !== parts[1]
+    || date.getUTCDate() !== parts[2]
+    || date.getUTCHours() !== parts[3]
+    || date.getUTCMinutes() !== parts[4]
+    || date.getUTCSeconds() !== parts[5]
+  ) {
+    const err = new Error('Invalid date-time value.');
+    err.status = 400;
+    throw err;
+  }
+  return text.replace('T', ' ');
 }
 
 function dateRange(date) {
@@ -499,6 +533,7 @@ async function ensureAuditTable() {
 }
 
 async function auditRequest(req, res, durationMs) {
+  if (!BACKGROUND_WRITES_ENABLED) return;
   if (!req.originalUrl.startsWith('/api/enormity/')) return;
   try {
     await ensureAuditTable();
@@ -571,6 +606,43 @@ function requireApiKey(req, res) {
   }
   const token = signAccessToken();
   return ok(res, { token, tokenType: 'Bearer', expiresInSeconds: 86400 });
+}
+
+function realtimeTicketDigest(ticket) {
+  return crypto.createHash('sha256').update(String(ticket || '')).digest('hex');
+}
+
+function cleanupRealtimeTickets(now = Date.now()) {
+  for (const [digest, ticket] of realtimeTickets) {
+    if (!ticket || ticket.expiresAt <= now) realtimeTickets.delete(digest);
+  }
+  while (realtimeTickets.size >= REALTIME_TICKET_LIMIT) {
+    const oldest = realtimeTickets.keys().next().value;
+    if (!oldest) break;
+    realtimeTickets.delete(oldest);
+  }
+}
+
+function issueRealtimeTicket(scope, subject) {
+  cleanupRealtimeTickets();
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  realtimeTickets.set(realtimeTicketDigest(ticket), {
+    companyId: scope.companyId,
+    global: scope.global,
+    subject: String(subject || 'nexus-server').slice(0, 120),
+    expiresAt: Date.now() + REALTIME_TICKET_TTL_MS,
+  });
+  return ticket;
+}
+
+function consumeRealtimeTicket(ticket) {
+  const normalized = String(ticket || '').trim();
+  if (!/^[A-Za-z0-9_-]{40,80}$/.test(normalized)) return null;
+  const digest = realtimeTicketDigest(normalized);
+  const record = realtimeTickets.get(digest) || null;
+  realtimeTickets.delete(digest);
+  if (!record || record.expiresAt <= Date.now()) return null;
+  return record;
 }
 
 
@@ -781,6 +853,498 @@ app.get('/api/enormity/version', publicLimiter, async (req, res) => {
 });
 
 app.use('/api/enormity', authenticateJwt, protectedLimiter);
+
+// Nexus-only live-data boundary. The browser never calls these endpoints
+// directly. Nexus resolves the company code stored in its server-side session,
+// then sends only the resulting numeric companyId on subsequent requests.
+app.get('/api/enormity/nexus/tenant-scope', async (req, res) => {
+  try {
+    const companyCode = String(req.query.companyCode || '').trim();
+    if (!companyCode || companyCode.length > 100 || /[\u0000-\u001f\u007f]/.test(companyCode)) {
+      return fail(res, 400, 'A valid companyCode is required.');
+    }
+    const rows = await query(
+      `SELECT COMPANYID AS companyId
+         FROM companys
+        WHERE LOWER(COMPANYCODE) = LOWER(?)
+        ORDER BY COMPANYID
+        LIMIT 2`,
+      [companyCode]
+    );
+    if (rows.length !== 1) {
+      return fail(res, rows.length ? 409 : 404, rows.length ? 'Company code is not unique.' : 'Company scope was not found.');
+    }
+    return ok(res, { companyId: Number(rows[0].companyId) });
+  } catch (err) {
+    return handleRouteError(res, '/api/enormity/nexus/tenant-scope', err, 'Failed to resolve Nexus tenant scope.');
+  }
+});
+
+app.get('/api/enormity/nexus/dashboard', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const companyFor = (column) => scope.global ? { clause: '', params: [] } : { clause: ` AND ${column} = ?`, params: [companyId] };
+    const deptScope = companyFor('d.COMPANYID');
+    const historyScope = companyFor('COMPANYID');
+    const readerScope = companyFor('COMPANYID');
+    const logScope = companyFor('COMPANYID');
+    const alarmScope = companyFor('COMPANYID');
+    const noticeScope = companyFor('companyid');
+
+    const [overviewRows, activityRows, deviceRows, logRows, alarmTotalRows, alarmRows, noticeTotalRows, noticeRows] = await Promise.all([
+      query(
+        `SELECT
+           (SELECT COUNT(*) FROM sites s JOIN depts d ON d.DEPTID = s.DEPTID WHERE 1=1${deptScope.clause}) AS siteTotal,
+           (SELECT COUNT(*) FROM guards g JOIN depts d ON d.DEPTID = g.DEPTID WHERE 1=1${deptScope.clause}) AS guardTotal,
+           (SELECT COUNT(*) FROM plans p JOIN depts d ON d.DEPTID = p.DEPTID WHERE 1=1${deptScope.clause}) AS planTotal,
+           (SELECT COUNT(*) FROM plans p JOIN depts d ON d.DEPTID = p.DEPTID WHERE p.ENDDATE < NOW()${deptScope.clause}) AS planExpired,
+           (SELECT COUNT(*) FROM readers WHERE DELETED = 0${readerScope.clause}) AS deviceTotal,
+           (SELECT COUNT(*) FROM readers WHERE DELETED = 0 AND LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)${readerScope.clause}) AS deviceOnline,
+           (SELECT COUNT(*) FROM depts d WHERE 1=1${deptScope.clause}) AS departmentTotal`,
+        [...deptScope.params, ...deptScope.params, ...deptScope.params, ...deptScope.params, ...readerScope.params, ...readerScope.params, ...deptScope.params]
+      ),
+      query(
+        `SELECT COUNT(DISTINCT SITEID) AS sitesUsed,
+                COUNT(DISTINCT GUARDID) AS guardsUsed,
+                COUNT(*) AS scans30Days,
+                MAX(HAPPENTIME) AS lastScan
+           FROM historydatas
+          WHERE HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 30 DAY)${historyScope.clause}`,
+        historyScope.params
+      ),
+      query(
+        `SELECT READERID AS id,
+                READERCODE AS readerCode,
+                NAME AS name,
+                COMPANYID AS companyId,
+                LASTTIME AS lastTime,
+                ENDDATE AS licenceExpiry,
+                CASE WHEN LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE) THEN 'ONLINE' ELSE 'OFFLINE' END AS status
+           FROM readers
+          WHERE DELETED = 0${readerScope.clause}
+          ORDER BY LASTTIME DESC, READERID DESC
+          LIMIT 1000`,
+        readerScope.params
+      ),
+      query(
+        `SELECT LOGID AS logid,
+                OPERATEFORM AS operateform,
+                LOGCONTENT AS logcontent,
+                OPERATERANK AS operaterank,
+                OPERATETIME AS operatetime,
+                USERNAME AS username,
+                READERCODE AS readercode,
+                IPADDRESS AS ipaddress,
+                COMPANYID AS companyId
+           FROM logs
+          WHERE DELETED = 0${logScope.clause}
+          ORDER BY OPERATETIME DESC, LOGID DESC
+          LIMIT 10`,
+        logScope.params
+      ),
+      query(
+        `SELECT COUNT(*) AS total
+           FROM alarmdatas
+          WHERE HAPPENTIME >= CURDATE()
+            AND HAPPENTIME < DATE_ADD(CURDATE(), INTERVAL 1 DAY)${alarmScope.clause}`,
+        alarmScope.params
+      ),
+      query(
+        `SELECT ID AS id,
+                COMPANYID AS companyId,
+                ALARMTYPE AS alarmtype,
+                ALARMINFO AS alarminfo,
+                DEPTNAME AS deptname,
+                SITENAME AS sitename,
+                GUARDNAME AS guardname,
+                READERCODE AS readercode,
+                HAPPENTIME AS happentime,
+                LONGITUDE AS longitude,
+                LATITUDE AS latitude
+           FROM alarmdatas
+          WHERE HAPPENTIME >= CURDATE()
+            AND HAPPENTIME < DATE_ADD(CURDATE(), INTERVAL 1 DAY)${alarmScope.clause}
+          ORDER BY HAPPENTIME DESC, ID DESC
+          LIMIT 200`,
+        alarmScope.params
+      ),
+      query(`SELECT COUNT(*) AS total FROM notices WHERE 1=1${noticeScope.clause}`, noticeScope.params),
+      query(
+        `SELECT id,
+                title,
+                content,
+                sendstatus,
+                sendtime,
+                createtime,
+                companyid AS companyId
+           FROM notices
+          WHERE 1=1${noticeScope.clause}
+          ORDER BY createtime DESC, id DESC
+          LIMIT 20`,
+        noticeScope.params
+      ),
+    ]);
+
+    const overview = overviewRows[0] || {};
+    const activity = activityRows[0] || {};
+    const sitesUsed = Number(activity.sitesUsed || 0);
+    const guardsUsed = Number(activity.guardsUsed || 0);
+    const siteTotal = Number(overview.siteTotal || 0);
+    const guardTotal = Number(overview.guardTotal || 0);
+    const deviceTotal = Number(overview.deviceTotal || 0);
+    const deviceOnline = Number(overview.deviceOnline || 0);
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar', realtime: 'authenticated-websocket' },
+      generatedAt: timestamp(),
+      overview: {
+        site: { total: siteTotal, used: sitesUsed, unused: Math.max(0, siteTotal - sitesUsed) },
+        guard: { total: guardTotal, used: guardsUsed, unused: Math.max(0, guardTotal - guardsUsed) },
+        plan: { total: Number(overview.planTotal || 0), expired: Number(overview.planExpired || 0) },
+        device: { total: deviceTotal, used: deviceOnline, unused: Math.max(0, deviceTotal - deviceOnline) },
+      },
+      summaries: {
+        departments: Number(overview.departmentTotal || 0),
+        guards: guardTotal,
+        devices: deviceTotal,
+        devicesOnline: deviceOnline,
+        devicesOffline: Math.max(0, deviceTotal - deviceOnline),
+        scans30Days: Number(activity.scans30Days || 0),
+        lastScan: activity.lastScan || null,
+      },
+      logs: { total: logRows.length, rows: logRows },
+      alarms: { total: Number(alarmTotalRows[0]?.total || 0), rows: alarmRows },
+      notices: { total: Number(noticeTotalRows[0]?.total || 0), rows: noticeRows },
+      devices: { total: deviceTotal, rows: deviceRows },
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/dashboard', err, 'Failed to load direct Nexus dashboard data.');
+  }
+});
+
+app.get('/api/enormity/nexus/logs', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const current = parsePositiveInt(req.query.current, 1, 10000);
+    const pageSize = parsePositiveInt(req.query.pageSize, 10, 100);
+    const beginTime = nexusDateTime(req.query.BeginTime, '1970-01-01 00:00:00');
+    const endTime = nexusDateTime(req.query.EndTime, '2999-12-31 23:59:59');
+    const where = [`DELETED = 0`, `OPERATETIME BETWEEN ? AND ?`];
+    const params = [beginTime, endTime];
+    if (!scope.global) {
+      where.push('COMPANYID = ?');
+      params.push(companyId);
+    }
+    const offset = (current - 1) * pageSize;
+    const [totalRows, rows] = await Promise.all([
+      query(`SELECT COUNT(*) AS total FROM logs WHERE ${where.join(' AND ')}`, params),
+      query(
+        `SELECT LOGID AS logid,
+                OPERATEFORM AS operateform,
+                LOGCONTENT AS logcontent,
+                OPERATERANK AS operaterank,
+                OPERATETIME AS operatetime,
+                USERNAME AS username,
+                READERCODE AS readercode,
+                IPADDRESS AS ipaddress,
+                COMPANYID AS companyId
+           FROM logs
+          WHERE ${where.join(' AND ')}
+          ORDER BY OPERATETIME DESC, LOGID DESC
+          LIMIT ${pageSize} OFFSET ${offset}`,
+        params
+      ),
+    ]);
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar' },
+      generatedAt: timestamp(),
+      total: Number(totalRows[0]?.total || 0),
+      rows,
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global|date-time/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/logs', err, 'Failed to load direct Nexus logs.');
+  }
+});
+
+app.get('/api/enormity/nexus/departments', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const companyClause = scope.global ? '' : ' AND d.COMPANYID = ?';
+    const rows = await query(
+      `SELECT d.DEPTID AS id,
+              d.DEPTNAME AS label,
+              d.PARENTDEPTID AS parentId,
+              d.DEPTCODE AS code,
+              d.DEPTSN AS sortOrder,
+              d.COMPANYID AS companyId
+         FROM depts d
+        WHERE IFNULL(d.VALID, 1) <> 0${companyClause}
+        ORDER BY d.DEPTSN, d.DEPTID`,
+      scope.global ? [] : [companyId]
+    );
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar' },
+      generatedAt: timestamp(),
+      total: rows.length,
+      rows,
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/departments', err, 'Failed to load direct Nexus departments.');
+  }
+});
+
+app.get('/api/enormity/nexus/guards', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const rawDeptId = String(req.query.deptId || '').trim();
+    const rawGuardId = String(req.query.guardId || '').trim();
+    const deptId = rawDeptId ? normalizeCompanyId(rawDeptId) : null;
+    const guardId = rawGuardId ? normalizeCompanyId(rawGuardId) : null;
+    if ((rawDeptId && !deptId) || (rawGuardId && !guardId)) return fail(res, 400, 'deptId and guardId must be positive integers.');
+
+    const conditions = ['1=1'];
+    const params = [];
+    if (!scope.global) {
+      conditions.push('d.COMPANYID = ?');
+      params.push(companyId);
+    }
+    if (deptId) {
+      conditions.push('g.DEPTID = ?');
+      params.push(deptId);
+    }
+    if (guardId) {
+      conditions.push('g.GUARDID = ?');
+      params.push(guardId);
+    }
+
+    const rows = await query(
+      `SELECT g.GUARDID AS id,
+              g.GUARDCODE AS code,
+              g.GUARDNAME AS name,
+              g.DEPTID AS departmentId,
+              d.DEPTNAME AS department,
+              g.TELEPHONE AS phone,
+              g.guardtype AS guardType,
+              d.COMPANYID AS companyId,
+              COUNT(DISTINCT fi.ID) AS fingerprintCount
+         FROM guards g
+         JOIN depts d ON d.DEPTID = g.DEPTID
+    LEFT JOIN fingerinfo fi ON fi.GUARDID = g.GUARDID AND fi.COMPANYID = d.COMPANYID
+        WHERE ${conditions.join(' AND ')}
+        GROUP BY g.GUARDID, g.GUARDCODE, g.GUARDNAME, g.DEPTID, d.DEPTNAME, g.TELEPHONE, g.guardtype, d.COMPANYID
+        ORDER BY d.DEPTSN, g.GUARDNAME, g.GUARDID
+        LIMIT 2000`,
+      params
+    );
+
+    let activity = [];
+    if (guardId && rows.length === 1) {
+      const activityConditions = ['h.GUARDID = ?', 'h.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 7 DAY)'];
+      const activityParams = [guardId];
+      if (!scope.global) {
+        activityConditions.push('h.COMPANYID = ?');
+        activityParams.push(companyId);
+      }
+      activity = await query(
+        `SELECT h.ID AS id,
+                h.COMPANYID AS companyId,
+                h.SITENAME AS site,
+                h.EVENTINFO AS event,
+                h.HAPPENTIME AS timestamp,
+                h.READERCODE AS readerCode,
+                h.STATUS AS status
+           FROM historydatas h
+          WHERE ${activityConditions.join(' AND ')}
+          ORDER BY h.HAPPENTIME DESC, h.ID DESC
+          LIMIT 8`,
+        activityParams
+      );
+    }
+
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar' },
+      generatedAt: timestamp(),
+      total: rows.length,
+      rows,
+      activity,
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/guards', err, 'Failed to load direct Nexus guards.');
+  }
+});
+
+app.get('/api/enormity/nexus/alerts/unacknowledged', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const rows = await query(
+      `SELECT COUNT(*) AS total
+         FROM enormity_escalations
+        WHERE requiresAck = 1${scope.global ? '' : ' AND companyid = ?'}`,
+      scope.global ? [] : [companyId]
+    );
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar' },
+      generatedAt: timestamp(),
+      total: Number(rows[0]?.total || 0),
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/alerts/unacknowledged', err, 'Failed to count direct Nexus alerts.');
+  }
+});
+
+app.get('/api/enormity/nexus/live-map', async (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.query);
+    const companyId = scope.companyId;
+    const condition = (column) => scope.global ? { clause: '', params: [] } : { clause: ` AND ${column} = ?`, params: [companyId] };
+    const deptScope = condition('d.COMPANYID');
+    const alarmScope = condition('a.COMPANYID');
+    const mapScope = condition('m.COMPANYID');
+    const enclosureScope = condition('e.COMPANYID');
+    const [realData, alarmData, mapData, enclosureDevices, enclosures] = await Promise.all([
+      query(
+        `WITH ranked AS (
+           SELECT r.ID AS id,
+                  r.DEPTID AS deptId,
+                  r.DEPTNAME AS deptName,
+                  r.GUARDID AS guardId,
+                  r.GUARDNAME AS guardName,
+                  r.SITEID AS siteId,
+                  r.SITENAME AS siteName,
+                  r.READERCODE AS readerCode,
+                  r.EVENTINFO AS eventInfo,
+                  r.HAPPENTIME AS operateTime,
+                  r.LONGITUDE AS longitude,
+                  r.LATITUDE AS latitude,
+                  d.COMPANYID AS companyId,
+                  ROW_NUMBER() OVER (PARTITION BY r.READERCODE ORDER BY r.HAPPENTIME DESC, r.ID DESC) AS rn
+             FROM realdatas r
+             JOIN depts d ON d.DEPTID = r.DEPTID
+            WHERE 1=1${deptScope.clause}
+         )
+         SELECT * FROM ranked WHERE rn = 1 ORDER BY operateTime DESC, id DESC LIMIT 250`,
+        deptScope.params
+      ),
+      query(
+        `SELECT a.ID AS id,
+                a.COMPANYID AS companyId,
+                a.DEPTID AS deptId,
+                a.DEPTNAME AS deptName,
+                a.GUARDID AS guardId,
+                a.GUARDNAME AS guardName,
+                a.SITEID AS siteId,
+                a.SITENAME AS siteName,
+                a.READERCODE AS readerCode,
+                a.ALARMTYPE AS alarmType,
+                a.ALARMINFO AS alarmInfo,
+                a.HAPPENTIME AS operateTime,
+                a.LONGITUDE AS longitude,
+                a.LATITUDE AS latitude,
+                'alarm' AS status
+           FROM alarmdatas a
+          WHERE a.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 72 HOUR)${alarmScope.clause}
+          ORDER BY a.HAPPENTIME DESC, a.ID DESC
+          LIMIT 100`,
+        alarmScope.params
+      ),
+      query(
+        `SELECT m.ID AS id,
+                m.COMPANYID AS companyId,
+                m.DEPTID AS deptId,
+                m.SITEID AS siteId,
+                m.SITENAME AS siteName,
+                m.HAPPENTIME AS operateTime,
+                m.LONGITUDE AS longitude,
+                m.LATITUDE AS latitude,
+                m.ARRIVED AS arrived,
+                'site' AS status
+           FROM mapdatas m
+          WHERE 1=1${mapScope.clause}
+          ORDER BY COALESCE(m.HAPPENTIME, m.ENDTIME) DESC, m.ID DESC
+          LIMIT 200`,
+        mapScope.params
+      ),
+      query(
+        `SELECT eu.ID AS id,
+                e.COMPANYID AS companyId,
+                eu.DEVICECODE AS readerCode,
+                eu.STATE AS state,
+                eu.LASTTIME AS operateTime,
+                eu.ALARMED AS alarmed,
+                eu.LONGITUDE AS longitude,
+                eu.LATITUDE AS latitude,
+                e.ENCLOSURENAME AS enclosureName
+           FROM enclosureuser eu
+           JOIN enclosure e ON e.ID = eu.ENCLOUSUREID
+          WHERE 1=1${enclosureScope.clause}
+          ORDER BY eu.LASTTIME DESC, eu.ID DESC
+          LIMIT 500`,
+        enclosureScope.params
+      ),
+      query(
+        `SELECT e.ID AS id,
+                e.COMPANYID AS companyId,
+                e.ENCLOSURENAME AS enclosureName,
+                e.ALARMTYPE AS alarmType,
+                ep.POINTSTRING AS pointString
+           FROM enclosure e
+      LEFT JOIN enclosurepoints ep ON ep.enclosureid = e.ID
+          WHERE 1=1${enclosureScope.clause}
+          ORDER BY e.ID
+          LIMIT 500`,
+        enclosureScope.params
+      ),
+    ]);
+    return ok(res, {
+      scope: { kind: scope.global ? 'global' : 'company', companyId },
+      provenance: { source: 'cloudpatrol-mysql', adapter: 'enormity-sidecar' },
+      generatedAt: timestamp(),
+      realData,
+      alarmData,
+      mapData,
+      enclosureDevices,
+      enclosures,
+    });
+  } catch (err) {
+    const status = /companyId|company scope|either global/i.test(err.message || '') ? 400 : 500;
+    if (status === 400) return fail(res, status, err.message);
+    return handleRouteError(res, '/api/enormity/nexus/live-map', err, 'Failed to load direct Nexus map data.');
+  }
+});
+
+app.post('/api/enormity/nexus/realtime-ticket', (req, res) => {
+  try {
+    const scope = normalizeRealtimeScope(req.body || {});
+    const ticket = issueRealtimeTicket(scope, req.enormityAuth?.subject);
+    res.setHeader('Cache-Control', 'no-store');
+    return ok(res, {
+      ticket,
+      expiresInSeconds: Math.floor(REALTIME_TICKET_TTL_MS / 1000),
+      scope: { kind: scope.global ? 'global' : 'company', companyId: scope.companyId },
+    });
+  } catch (err) {
+    return fail(res, 400, err.message || 'Invalid realtime scope.');
+  }
+});
 
 app.get('/api/enormity/mobile/dashboard', async (req, res) => {
   try {
@@ -2158,14 +2722,15 @@ app.get('/api/enormity/devices/maintenance-due', async (req, res) => {
 });
 
 const wsServer = http.createServer();
-const wss = new WebSocket.Server({ server: wsServer });
+const wss = new WebSocket.Server({ server: wsServer, maxPayload: 1024, perMessageDeflate: false });
 let lastScanId = 0;
+let lastAlarmId = 0;
 let lastEscalationId = 0;
 
 function broadcast(event) {
   const payload = JSON.stringify(event);
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client.readyState === WebSocket.OPEN && canReceiveRealtimeEvent(client.nexusCompanyId, event.companyId)) {
       try {
         client.send(payload);
       } catch (err) {
@@ -2175,12 +2740,31 @@ function broadcast(event) {
   }
 }
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, request) => {
+  let ticketRecord = null;
+  try {
+    const url = new URL(request.url || '/', 'ws://enormity-sidecar.internal');
+    ticketRecord = consumeRealtimeTicket(url.searchParams.get('ticket'));
+  } catch (_) {
+    ticketRecord = null;
+  }
+  if (!ticketRecord) {
+    socket.close(1008, 'A valid one-time realtime ticket is required.');
+    return;
+  }
+  socket.nexusCompanyId = ticketRecord.global ? null : ticketRecord.companyId;
   socket.isAlive = true;
   socket.on('pong', () => {
     socket.isAlive = true;
   });
-  socket.send(JSON.stringify({ event: 'CONNECTED', service: 'enormity-realtime', timestamp: timestamp() }));
+  socket.on('message', () => socket.close(1008, 'Realtime connections are read-only.'));
+  socket.send(JSON.stringify({
+    event: 'CONNECTED',
+    service: 'enormity-realtime',
+    scope: ticketRecord.global ? 'global' : 'company',
+    companyId: ticketRecord.companyId,
+    timestamp: timestamp(),
+  }));
 });
 
 function heartbeatWebSocketClients() {
@@ -2201,8 +2785,10 @@ function heartbeatWebSocketClients() {
 async function initialiseRealtimeCursors() {
   try {
     const scanRows = await query('SELECT COALESCE(MAX(ID), 0) AS id FROM historydatas');
+    const alarmRows = await query('SELECT COALESCE(MAX(ID), 0) AS id FROM alarmdatas');
     const escalationRows = await query('SELECT COALESCE(MAX(escalation_id), 0) AS id FROM enormity_escalations');
     lastScanId = Number(scanRows[0]?.id || 0);
+    lastAlarmId = Number(alarmRows[0]?.id || 0);
     lastEscalationId = Number(escalationRows[0]?.id || 0);
   } catch (err) {
     console.error('realtime cursor init failed:', err.message);
@@ -2214,6 +2800,7 @@ async function pollPatrolScans() {
   try {
     rows = await query(
       `SELECT ID AS id,
+              COMPANYID AS companyId,
               GUARDNAME AS guardName,
               SITENAME AS siteName,
               HAPPENTIME AS happenTime,
@@ -2229,6 +2816,7 @@ async function pollPatrolScans() {
       lastScanId = Math.max(lastScanId, Number(row.id));
       broadcast({
         event: 'NEW_PATROL_SCAN',
+        companyId: row.companyId,
         guardName: row.guardName,
         siteName: row.siteName,
         happenTime: row.happenTime,
@@ -2238,6 +2826,46 @@ async function pollPatrolScans() {
     }
   } catch (err) {
     console.error('patrol scan poll failed:', err.message);
+  } finally {
+    rows = null;
+  }
+}
+
+async function pollAlarmRows() {
+  let rows = [];
+  try {
+    rows = await query(
+      `SELECT ID AS alarmId,
+              COMPANYID AS companyId,
+              ALARMTYPE AS alarmType,
+              ALARMINFO AS alarmInfo,
+              GUARDNAME AS guardName,
+              SITENAME AS siteName,
+              READERCODE AS readerCode,
+              HAPPENTIME AS happenTime
+         FROM alarmdatas
+        WHERE ID > ?
+        ORDER BY ID ASC
+        LIMIT 100`,
+      [lastAlarmId]
+    );
+    for (const row of rows) {
+      lastAlarmId = Math.max(lastAlarmId, Number(row.alarmId));
+      broadcast({
+        event: 'NEW_ALARM',
+        alarmId: row.alarmId,
+        companyId: row.companyId,
+        alarmType: row.alarmType,
+        alarmInfo: row.alarmInfo,
+        guardName: row.guardName,
+        siteName: row.siteName,
+        readerCode: row.readerCode,
+        severity: Number(row.alarmType) === 1 ? 'CRITICAL' : 'WARNING',
+        createdAt: row.happenTime,
+      });
+    }
+  } catch (err) {
+    console.error('raw alarm poll failed:', err.message);
   } finally {
     rows = null;
   }
@@ -2294,7 +2922,7 @@ async function pollCriticalSosAlarms() {
         severity: 'CRITICAL',
         createdAt: row.happenTime,
       };
-      broadcast({ event: 'NEW_ALARM', ...escalation });
+      // pollAlarmRows is the single read-only source for raw alarm events.
       sendTelegramAlert(escalation).catch((err) => console.error('telegram sos failed:', err.message));
     }
   } catch (err) {
@@ -2319,7 +2947,6 @@ async function pollEscalations() {
               created_at AS createdAt
          FROM enormity_escalations
         WHERE escalation_id > ?
-           OR (requiresAck = 1 AND status = 'ACTIVE' AND severity = 'CRITICAL')
         ORDER BY escalation_id ASC
         LIMIT 100`,
       [lastEscalationId]
@@ -2328,6 +2955,7 @@ async function pollEscalations() {
       lastEscalationId = Math.max(lastEscalationId, Number(row.escalationId));
       broadcast({
         event: 'NEW_ALARM',
+        companyId: row.companyId,
         alarmType: row.alarmType,
         guardName: row.guardName,
         severity: row.severity,
@@ -2384,19 +3012,23 @@ function waitForInflight(maxMs) {
 }
 
 validateStartup().then(() => {
-  server = app.listen(PORT, '127.0.0.1', () => {
-    console.log(`Enormity sidecar API listening on http://127.0.0.1:${PORT}`);
+  server = app.listen(PORT, BIND_HOST, () => {
+    console.log(`Enormity sidecar API listening on http://${BIND_HOST}:${PORT}`);
   });
 
-  wsServer.listen(WS_PORT, '127.0.0.1', async () => {
+  wsServer.listen(WS_PORT, BIND_HOST, async () => {
     await initialiseRealtimeCursors();
     trackInterval(setInterval(pollPatrolScans, 10000));
-    trackInterval(setInterval(pollCriticalSosAlarms, 5000));
-    trackInterval(setInterval(pollEscalations, 5000));
+    trackInterval(setInterval(pollAlarmRows, 5000));
+    if (BACKGROUND_WRITES_ENABLED) {
+      trackInterval(setInterval(pollCriticalSosAlarms, 5000));
+      trackInterval(setInterval(pollEscalations, 5000));
+      trackInterval(setInterval(cleanupAuditLogs, 60000));
+      trackInterval(setInterval(() => runMonthlyArchiveScheduler(false).catch((err) => console.error('[Enormity] archive scheduler failed:', err.message)), 60000));
+    }
     trackInterval(setInterval(heartbeatWebSocketClients, 30000));
-    trackInterval(setInterval(cleanupAuditLogs, 60000));
-    trackInterval(setInterval(() => runMonthlyArchiveScheduler(false).catch((err) => console.error('[Enormity] archive scheduler failed:', err.message)), 60000));
-    console.log(`Enormity realtime WebSocket listening on ws://127.0.0.1:${WS_PORT}`);
+    trackInterval(setInterval(cleanupRealtimeTickets, 30000));
+    console.log(`Enormity realtime WebSocket listening on ws://${BIND_HOST}:${WS_PORT}`);
   });
 }).catch((err) => {
   console.error('[Enormity] Startup validation failed:', err.message);
