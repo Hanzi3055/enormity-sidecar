@@ -12,6 +12,9 @@ JWT-authenticated REST API serving analytics, KPM compliance reports, and real-t
 - `GET  /api/enormity/patrol/live` — Live patrol feed
 - `GET  /api/enormity/guards/efficiency` — Guard efficiency scores
 - `GET  /api/enormity/devices/status` — Fleet health monitoring
+- `GET  /api/enormity/nexus/dashboard` — Tenant-scoped direct database dashboard
+- `GET  /api/enormity/nexus/live-map` — Tenant-scoped direct map telemetry
+- `POST /api/enormity/nexus/realtime-ticket` — Single-use authenticated WebSocket ticket
 - `GET  /api/enormity/analytics/heatmap` — Hourly scan heatmap
 - `GET  /api/enormity/reports/pkk2/pdf` — KPM PKK 2 Manpower Report PDF
 - `GET  /api/enormity/reports/pkk3/pdf` — KPM PKK 3 Attendance Report PDF
@@ -19,7 +22,7 @@ JWT-authenticated REST API serving analytics, KPM compliance reports, and real-t
 - `GET  /api/enormity/reports/bundle/pdf` — All KPM reports as ZIP
 
 ## Tech Stack
-- Node.js 16 + Express
+- Node.js 24 + Express
 - MySQL 8.4.3 (read-only via enormity_reader user)
 - JWT authentication (jsonwebtoken)
 - Rate limiting (express-rate-limit)
@@ -50,6 +53,10 @@ The sidecar is the in-house innovation layer that turns OEM patrol records into 
 - `ecosystem.config.js` - PM2 production process definition for sidecar and healer.
 - `.env.example` - Safe configuration template with no production secrets.
 
+### Nexus V2 direct-data boundary
+
+Nexus V2 supplies the company code only from its server-side session. The sidecar resolves that code to one numeric company ID, and every dashboard, alert, device, guard, department, and map query applies that scope in SQL. Company WebSocket clients receive only events carrying the same company ID. Tickets are short-lived, single-use, stored as hashes, and never exposed to browser JavaScript. Biometric templates and credentials are excluded from these endpoints.
+
 ### Live verification URLs
 - `https://nexus.enormity.tech/api/enormity/health`
 - `https://nexus.enormity.tech/api/enormity/docs`
@@ -69,4 +76,3 @@ The sidecar is the in-house innovation layer that turns OEM patrol records into 
 - Public, auth, and protected route rate limits are split.
 - Redis cache stats use `INFO memory` and `INFO stats`, not blocking key scans.
 - Startup validation checks required configuration, database connectivity, and Redis connectivity before accepting traffic.
-

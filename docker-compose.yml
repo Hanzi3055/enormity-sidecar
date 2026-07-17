@@ -1,0 +1,53 @@
+services:
+  sidecar:
+    image: ${SIDECAR_IMAGE:-enormity-sidecar:node24-direct-live}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: enormity-sidecar
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${SIDECAR_ENV_FILE:-.env}
+    environment:
+      NODE_ENV: production
+      PORT: 3100
+      WS_PORT: 3101
+      SIDECAR_BIND_HOST: 0.0.0.0
+      MYSQL_HOST: cloudpatrol-db
+      MYSQL_PORT: 3306
+      REDIS_HOST: cloudpatrol-cache
+      # CloudPatrol's hardened redis.conf listens on 16379 inside the container.
+      REDIS_PORT: 16379
+      KPM_ARCHIVE_ROOT: /app/reports/archive
+      CONTAINER_STATUS_FILE: /run/enormity/container-status.tsv
+    ports:
+      - "127.0.0.1:3100:3100"
+      - "127.0.0.1:3101:3101"
+    volumes:
+      - ./reports/archive:/app/reports/archive
+      - /opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour:/opt/CloudPatrol/appFile/web/ROOT/WEB-INF/classes/com/tour:ro
+      - /run/enormity/container-status.tsv:/run/enormity/container-status.tsv:ro
+    networks:
+      - cloudpatrol
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    mem_limit: 1g
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/api/enormity/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    stop_grace_period: 35s
+
+networks:
+  cloudpatrol:
+    external: true
+    name: cloudpatrol_default
