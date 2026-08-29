@@ -52,6 +52,34 @@ async function fixture(pool) {
   };
 }
 
+async function expectedDevicePresence(pool, companyId) {
+  const [rows] = await pool.execute(
+    `SELECT COUNT(*) AS total,
+            SUM(CASE WHEN
+              r.LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+              OR EXISTS (
+                SELECT 1
+                  FROM historydatas h
+                 WHERE h.COMPANYID = r.COMPANYID
+                   AND h.READERCODE = r.READERCODE
+                   AND h.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+              )
+              OR EXISTS (
+                SELECT 1
+                  FROM realdatas rd
+                  JOIN depts d ON d.DEPTID = rd.DEPTID
+                 WHERE d.COMPANYID = r.COMPANYID
+                   AND rd.READERCODE = r.READERCODE
+                   AND rd.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+              ) THEN 1 ELSE 0 END) AS online
+       FROM readers r
+      WHERE r.COMPANYID = ?
+        AND r.DELETED = 0`,
+    [companyId]
+  );
+  return { total: Number(rows[0]?.total || 0), online: Number(rows[0]?.online || 0) };
+}
+
 async function main() {
   const apiKey = String(process.env.ENORMITY_API_KEYS || '').split(',').map((value) => value.trim()).find(Boolean);
   assert(apiKey, 'ENORMITY_API_KEYS is required.');
@@ -74,6 +102,18 @@ async function main() {
     });
     assert(tokenResult.response.status === 200 && tokenResult.body?.data?.token, 'Service token exchange failed.');
     const authorization = `Bearer ${tokenResult.body.data.token}`;
+
+    const expectedDevices = await expectedDevicePresence(pool, testFixture.companyId);
+    const dashboardResult = await jsonRequest(`/api/enormity/nexus/dashboard?companyId=${encodeURIComponent(testFixture.companyId)}`, {
+      headers: { authorization },
+    });
+    assert(dashboardResult.response.status === 200, 'Direct dashboard contract failed.');
+    assert(Number(dashboardResult.body?.data?.summaries?.devices) === expectedDevices.total, 'Dashboard device total differs from the company-scoped reader registry.');
+    assert(Number(dashboardResult.body?.data?.summaries?.devicesOnline) === expectedDevices.online, 'Dashboard online devices do not include recent patrol observations.');
+    const dashboardDevices = dashboardResult.body?.data?.devices?.rows;
+    assert(Array.isArray(dashboardDevices), 'Dashboard device rows are malformed.');
+    assert(dashboardDevices.every((row) => ['ONLINE', 'OFFLINE'].includes(String(row.status))), 'Dashboard device status is invalid.');
+    assert(dashboardDevices.filter((row) => row.status === 'ONLINE').length === expectedDevices.online, 'Device row status and dashboard online summary differ.');
 
     const locationResult = await jsonRequest('/api/enormity/nexus/v2/locations/search', {
       method: 'POST',
@@ -206,6 +246,12 @@ async function main() {
         contracts: Object.keys(contractTotals).sort(),
         totals: contractTotals,
         hostileTenantFilterBlocked: true,
+      },
+      devicePresence: {
+        status: dashboardResult.response.status,
+        total: expectedDevices.total,
+        online: expectedDevices.online,
+        observationAware: true,
       },
       tenantIsolationProbe: crossCompanyResult,
       writesLocked: true,

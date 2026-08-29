@@ -1433,7 +1433,7 @@ app.get('/api/enormity/nexus/dashboard', async (req, res) => {
     const companyFor = (column) => scope.global ? { clause: '', params: [] } : { clause: ` AND ${column} = ?`, params: [companyId] };
     const deptScope = companyFor('d.COMPANYID');
     const historyScope = companyFor('COMPANYID');
-    const readerScope = companyFor('COMPANYID');
+    const readerScope = companyFor('r.COMPANYID');
     const logScope = companyFor('COMPANYID');
     const alarmScope = companyFor('COMPANYID');
     const noticeScope = companyFor('companyid');
@@ -1445,8 +1445,28 @@ app.get('/api/enormity/nexus/dashboard', async (req, res) => {
            (SELECT COUNT(*) FROM guards g JOIN depts d ON d.DEPTID = g.DEPTID WHERE 1=1${deptScope.clause}) AS guardTotal,
            (SELECT COUNT(*) FROM plans p JOIN depts d ON d.DEPTID = p.DEPTID WHERE 1=1${deptScope.clause}) AS planTotal,
            (SELECT COUNT(*) FROM plans p JOIN depts d ON d.DEPTID = p.DEPTID WHERE p.ENDDATE < NOW()${deptScope.clause}) AS planExpired,
-           (SELECT COUNT(*) FROM readers WHERE DELETED = 0${readerScope.clause}) AS deviceTotal,
-           (SELECT COUNT(*) FROM readers WHERE DELETED = 0 AND LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)${readerScope.clause}) AS deviceOnline,
+           (SELECT COUNT(*) FROM readers r WHERE r.DELETED = 0${readerScope.clause}) AS deviceTotal,
+           (SELECT COUNT(*)
+              FROM readers r
+             WHERE r.DELETED = 0${readerScope.clause}
+               AND (
+                 r.LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+                 OR EXISTS (
+                   SELECT 1
+                     FROM historydatas h
+                    WHERE h.COMPANYID = r.COMPANYID
+                      AND h.READERCODE = r.READERCODE
+                      AND h.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM realdatas rd
+                     JOIN depts rd_dept ON rd_dept.DEPTID = rd.DEPTID
+                    WHERE rd_dept.COMPANYID = r.COMPANYID
+                      AND rd.READERCODE = r.READERCODE
+                      AND rd.HAPPENTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE)
+                 )
+               )) AS deviceOnline,
            (SELECT COUNT(*) FROM depts d WHERE 1=1${deptScope.clause}) AS departmentTotal`,
         [...deptScope.params, ...deptScope.params, ...deptScope.params, ...deptScope.params, ...readerScope.params, ...readerScope.params, ...deptScope.params]
       ),
@@ -1460,16 +1480,45 @@ app.get('/api/enormity/nexus/dashboard', async (req, res) => {
         historyScope.params
       ),
       query(
-        `SELECT READERID AS id,
-                READERCODE AS readerCode,
-                NAME AS name,
-                COMPANYID AS companyId,
-                LASTTIME AS lastTime,
-                ENDDATE AS licenceExpiry,
-                CASE WHEN LASTTIME >= DATE_SUB(NOW(), INTERVAL 120 MINUTE) THEN 'ONLINE' ELSE 'OFFLINE' END AS status
-           FROM readers
-          WHERE DELETED = 0${readerScope.clause}
-          ORDER BY LASTTIME DESC, READERID DESC
+        `WITH device_presence AS (
+           SELECT r.READERID AS id,
+                  r.READERCODE AS readerCode,
+                  r.NAME AS name,
+                  r.COMPANYID AS companyId,
+                  r.LASTTIME AS registryLastTime,
+                  r.ENDDATE AS licenceExpiry,
+                  (SELECT MAX(h.HAPPENTIME)
+                     FROM historydatas h
+                    WHERE h.COMPANYID = r.COMPANYID
+                      AND h.READERCODE = r.READERCODE) AS historyLastTime,
+                  (SELECT MAX(rd.HAPPENTIME)
+                     FROM realdatas rd
+                     JOIN depts rd_dept ON rd_dept.DEPTID = rd.DEPTID
+                    WHERE rd_dept.COMPANYID = r.COMPANYID
+                      AND rd.READERCODE = r.READERCODE) AS realtimeLastTime
+             FROM readers r
+            WHERE r.DELETED = 0${readerScope.clause}
+         )
+         SELECT id,
+                readerCode,
+                name,
+                companyId,
+                GREATEST(
+                  COALESCE(registryLastTime, '1000-01-01 00:00:00'),
+                  COALESCE(historyLastTime, '1000-01-01 00:00:00'),
+                  COALESCE(realtimeLastTime, '1000-01-01 00:00:00')
+                ) AS lastTime,
+                registryLastTime,
+                historyLastTime,
+                realtimeLastTime,
+                licenceExpiry,
+                CASE WHEN GREATEST(
+                  COALESCE(registryLastTime, '1000-01-01 00:00:00'),
+                  COALESCE(historyLastTime, '1000-01-01 00:00:00'),
+                  COALESCE(realtimeLastTime, '1000-01-01 00:00:00')
+                ) >= DATE_SUB(NOW(), INTERVAL 120 MINUTE) THEN 'ONLINE' ELSE 'OFFLINE' END AS status
+           FROM device_presence
+          ORDER BY lastTime DESC, id DESC
           LIMIT 1000`,
         readerScope.params
       ),
