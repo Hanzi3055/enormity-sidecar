@@ -4,6 +4,12 @@ FROM ${NODE_IMAGE}
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Production database identity files are root-owned, read-only, and shared
+# only with this dedicated runtime group. Keep the image identity aligned with
+# that host contract so a clean GitHub build can read the least-privilege
+# credentials without running as root.
+RUN groupmod --gid 65533 node
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
