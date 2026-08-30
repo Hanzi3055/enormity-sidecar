@@ -3735,7 +3735,7 @@ async function sendTelegramAlert(escalation) {
     `Site: ${escalation.siteName || 'Unknown'}`,
     `Company: ${escalation.companyId || 'Unknown'}`,
     `Time: ${escalation.createdAt || timestamp()}`,
-    'Action required: Acknowledge at nexus.enormity.tech',
+    'Action required: Acknowledge at system.enormity.tech',
   ].join('\n');
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     chat_id: TELEGRAM_CHAT_ID,
